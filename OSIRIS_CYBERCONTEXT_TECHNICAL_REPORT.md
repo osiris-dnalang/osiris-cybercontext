@@ -5,6 +5,7 @@
 **System Telemetry:** OSIRIS Autonomous Research Runtime (DNA::}{::Lang Ecosystem)  
 **Repository:** https://github.com/osiris-dnalang/osiris-cybercontext  
 **Release:** v0.1.0 (Git Commit: `c4ac9c1`)  
+**Zenodo DOI:** https://doi.org/10.5281/zenodo.23305204  
 **Date:** October 2026  
 
 ---

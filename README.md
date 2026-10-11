@@ -1,5 +1,9 @@
 # OSIRIS × CyberContext: Governed Runtimes for Sovereign Agents
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23305204.svg)](https://doi.org/10.5281/zenodo.23305204)
+[![Release](https://img.shields.io/github/v/release/osiris-dnalang/osiris-cybercontext)](https://github.com/osiris-dnalang/osiris-cybercontext/releases/tag/v0.1.0)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 > **A high-assurance companion runtime for Olmo 3 benchmarking, CyberContext session memory, and Tandemonium hardware abstraction.**
 
 ---
