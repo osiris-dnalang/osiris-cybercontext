@@ -21,8 +21,10 @@ def canonical_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def compute_sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def compute_sha256(text: str | bytes) -> str:
+    if isinstance(text, str):
+        text = text.encode("utf-8")
+    return hashlib.sha256(text).hexdigest()
 
 
 @dataclass
@@ -77,10 +79,11 @@ class EvidenceLedger:
         action: str,
         payload_data: Any,
         metric_data: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
     ) -> LedgerRecord:
         last_id, prev_hash = self.get_latest_hash()
         new_id = last_id + 1
-        now = time.time()
+        now = timestamp if timestamp is not None else time.time()
 
         payload_digest = compute_sha256(canonical_json(payload_data))
         metrics = metric_data or {}
@@ -142,6 +145,19 @@ class EvidenceLedger:
             return self.GENESIS_HASH
         combined = ":".join(hashes)
         return compute_sha256(combined)
+
+    def merkle_root(self) -> str:
+        """Alias for get_merkle_root."""
+        return self.get_merkle_root()
+
+    def fetch_chain(self) -> List[Dict[str, Any]]:
+        """Fetch all ledger blocks as dictionaries."""
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM ledger ORDER BY entry_id ASC")
+        rows = [dict(r) for r in cursor.fetchall()]
+        self.conn.row_factory = None
+        return rows
 
     def close(self):
         self.conn.close()

@@ -92,13 +92,43 @@ osiris-cybercontext/
 ├── README.md                 # This overview
 ├── demo.py                   # 30-second runnable verification script
 ├── core/
-│   ├── __init__.py           # Package exports
+│   ├── __init__.py           # Core package exports
 │   ├── benchmark_harness.py  # Olmo 3 MTEB/BEIR ledger-backed evaluator
 │   ├── ast_firewall.py       # CyberContext AST sanitizer & injection firewall
 │   ├── hardware_mesh.py      # Tandemonium substrate & device contract bridge
 │   └── ledger.py             # Append-only SHA-256 SQLite hash chain
+├── workbench/
+│   ├── __init__.py           # Workbench exports
+│   ├── schema.py             # Canonical RFC 8785 experiment specs & policies
+│   ├── engine.py             # Governed execution engine with ceiling & grant gates
+│   ├── capsule.py            # Evidence capsule packager (.evidence.zip)
+│   ├── replay.py             # Replay engine with metric diffing & tamper detection
+│   └── cli.py                # CLI: run, verify, replay, and attack-demo
 └── tests/
-    └── test_bridge.py        # Complete unit test suite (pytest/unittest)
+    ├── test_bridge.py        # Core bridge integration unit tests
+    └── test_workbench.py     # Complete Evidence Workbench test suite
+```
+
+---
+
+## DNA-Lang Evidence Workbench (Milestone 1 Preview)
+
+*“Make computational experiments reproducible by construction.”*
+
+The workbench turns Olmo 3 / MTEB dense retrieval benchmarks into self-verifying, replayable evidence capsules:
+
+```bash
+# 1. Run canonical Olmo 3 SciFact retrieval evaluation & package evidence capsule:
+python -m workbench.cli run --queries 5 --out benchmark_capsule.evidence.zip
+
+# 2. Verify cryptographic capsule integrity without re-executing:
+python -m workbench.cli verify benchmark_capsule.evidence.zip
+
+# 3. Deterministically replay and diff metrics against stored ground truth:
+python -m workbench.cli replay benchmark_capsule.evidence.zip
+
+# 4. Simulate a database/capsule tampering attack and watch fail-closed defense:
+python -m workbench.cli attack-demo benchmark_capsule.evidence.zip
 ```
 
 ---
