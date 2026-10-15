@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23305204.svg)](https://doi.org/10.5281/zenodo.23305204)
 [![Release](https://img.shields.io/github/v/release/osiris-dnalang/osiris-cybercontext)](https://github.com/osiris-dnalang/osiris-cybercontext/releases/tag/v0.1.0)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **A zero-dependency prototype of a tamper-evident evidence ledger and replayable evidence capsules, sketched against Olmo 3 benchmarking, CyberContext session memory, and Tandemonium hardware.**
 
@@ -99,6 +99,7 @@ The intended design: models propose retrieval candidates and code changes, and t
 osiris-cybercontext/
 ├── README.md                 # This overview
 ├── ERRATA.md                 # Corrections to the v0.1.0 technical report
+├── LICENSE                   # Apache License 2.0
 ├── demo.py                   # 30-second demo of the core modules
 ├── core/
 │   ├── __init__.py           # Core package exports
@@ -208,3 +209,9 @@ v0.1.0 (`c4ac9c1`) contained the core modules and the demo. The evidence workben
 When you wrap up your Olmo 3 MTEB runs, let's connect:
 - **Plugging in a real Olmo 3 / MTEB run:** feed your actual evaluation output (scored results and binary qrels) into `core/benchmark_harness.py`, or replace the simulated engine, so a capsule records a real run. Check its numbers against MTEB's own before relying on them. Signing capsules would be the step that makes them trustworthy to a third party.
 - **CyberContext hook:** `core/ast_firewall.py` could run as a pre-store tripwire in your SQLite session pipeline, alongside real isolation rather than instead of it.
+
+---
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
