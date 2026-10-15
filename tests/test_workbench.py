@@ -173,6 +173,31 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self.assertFalse(verdict.is_passing())
         self.assertIn("Tamper detected", verdict.details)
 
+    def test_multicorpus_execution_and_replay(self):
+        """Verify multi-corpus evaluation across NFCorpus and CQADupStack."""
+        for ds in ["NFCorpus", "CQADupStack"]:
+            spec = ExperimentSpec(
+                experiment_id=f"EXP-TEST-{ds.upper()}",
+                model_id="allenai/Olmo-3-7B-Instruct",
+                benchmark_suite="MTEB/BEIR",
+                dataset=ds,
+                split="test",
+                query_count=4,
+                random_seed=77,
+            )
+            engine = EvidenceWorkbenchEngine()
+            result = engine.execute(spec)
+
+            self.assertEqual(result.metrics["queries_evaluated"], 4)
+            self.assertTrue(0.0 <= result.metrics["NDCG@10"] <= 1.0)
+            self.assertTrue(0.0 <= result.metrics["MRR@10"] <= 1.0)
+
+            capsule_p = os.path.join(self.tmp_dir.name, f"{ds}.evidence.zip")
+            EvidenceCapsule.pack(result, capsule_p)
+            verdict = ReplayEngine.replay(capsule_p)
+            self.assertEqual(verdict.status, ReplayStatus.EXACT_MATCH)
+            self.assertTrue(verdict.chain_digest_verified)
+
     def _spec(self, **overrides):
         fields = dict(
             experiment_id="EXP-HONESTY",
@@ -495,3 +520,4 @@ class TestEvidenceWorkbench(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
