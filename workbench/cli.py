@@ -2,12 +2,14 @@
 
 Usage:
     python -m workbench.cli run [--queries N] [--out PATH]
-    python -m workbench.cli replay <capsule_path>
+    python -m workbench.cli run-real --data DIR [--queries N] [--out PATH]
+    python -m workbench.cli replay <capsule_path> [--data DIR]
     python -m workbench.cli verify <capsule_path>
     python -m workbench.cli attack-demo [capsule_path]
 
-The benchmark run is simulated (see workbench/engine.py): no model or dataset
-is loaded.
+The default benchmark run is simulated (see workbench/engine.py): no model or
+dataset is loaded. ``run-real`` is the optional real backend: BM25 over a local
+BEIR SciFact directory (nothing is downloaded; see workbench/real_scifact.py).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from .engine import (
     QuotaExceededViolation,
     SIMULATION_NOTICE,
 )
+from .real_scifact import REAL_BACKEND, REAL_NOTICE, load_beir_dataset, run_real_scifact
 from .replay import ReplayEngine
 from .schema import ExperimentSpec, ExecutionPolicy, canonical_json_bytes, compute_sha256
 
@@ -64,6 +67,30 @@ def _build_spec(
             max_query_ceiling=ceiling,
             timeout_seconds=300.0,
             require_authorization_grant=(mode == "REMOTE_DISPATCH"),
+        ),
+    )
+
+
+def _build_real_spec(
+    queries: int,
+    ceiling: int = 1000,
+    experiment_id: str | None = None,
+) -> ExperimentSpec:
+    return ExperimentSpec(
+        experiment_id=experiment_id or "EXP-OLMO3-BEIR-SCIFACT-REAL-001",
+        model_id="bm25-stdlib",
+        benchmark_suite="MTEB/BEIR",
+        dataset="SciFact",
+        split="test",
+        query_count=queries,
+        top_k=10,
+        similarity_metric="bm25",
+        random_seed=42,
+        execution_policy=ExecutionPolicy(
+            mode="LOCAL_BOUNDED",
+            max_query_ceiling=ceiling,
+            timeout_seconds=300.0,
+            require_authorization_grant=False,
         ),
     )
 
@@ -108,6 +135,56 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_real(args: argparse.Namespace) -> int:
+    """Run real BM25 retrieval over a local BEIR SciFact directory and package a capsule."""
+    print("=" * 70)
+    print("  DNA-LANG EVIDENCE WORKBENCH: REAL RETRIEVAL (BM25) BENCHMARK RUNNER")
+    print("=" * 70)
+    print(f"[!] {REAL_NOTICE}")
+
+    try:
+        data = load_beir_dataset(args.data)
+    except (OSError, ValueError) as e:
+        print(f"[-] Could not load the SciFact dataset directory: {e}")
+        print("=" * 70)
+        return 2
+
+    queries = args.queries if args.queries is not None else len(data.queries)
+    spec = _build_real_spec(queries, args.ceiling, args.experiment_id)
+
+    print(f"[*] Experiment ID:         {spec.experiment_id}")
+    print(f"[*] Retrieval Backend:     {REAL_BACKEND}")
+    print(f"[*] Corpus Documents:     {len(data.corpus)}")
+    print(f"[*] Queries in Split:      {len(data.queries)} (evaluating {queries})")
+    print(f"[*] Dataset Directory:     {os.path.abspath(args.data)}")
+    print(f"[*] Execution Mode:        {spec.execution_policy.mode}")
+    print(f"[*] Canonical Spec Digest: {spec.canonical_digest()}")
+    print("-" * 70)
+
+    try:
+        result = run_real_scifact(spec, args.data)
+    except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
+        print(f"\n[FAIL-CLOSED VIOLATION DETECTED]")
+        print(f"Reason: {e}")
+        return 1
+
+    print("\n[+] Real Run Complete:")
+    print(f"    |-- Mean NDCG@10:              {result.metrics['NDCG@10']}")
+    print(f"    |-- Mean MRR@10:               {result.metrics['MRR@10']}")
+    print(f"    |-- CTC (derived score):       {result.metrics['CTC']}")
+    print(f"    |-- Ledger Chain Digest:       {result.chain_digest[:32]}...")
+    print(f"    |-- Ledger Blocks Recorded:    {result.ledger_blocks_count}")
+    print(f"    \\-- Elapsed Runtime:           {result.elapsed_seconds}s")
+
+    out_path = args.out or f"{spec.experiment_id}.evidence.zip"
+    capsule_path = EvidenceCapsule.pack(result, out_path)
+    print(f"\n[+] Evidence Capsule Bundled:      {capsule_path} ({os.path.getsize(capsule_path)} bytes)")
+    print("[i] These are real BM25 scores over the corpus you supplied, but they have not been")
+    print("    validated against a published reference; check before quoting them publicly.")
+    print("=" * 70)
+    return 0
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     """Re-run a capsule's spec with the installed code and compare the results."""
     print("=" * 70)
@@ -119,7 +196,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print("=" * 70)
         return 2
 
-    verdict = ReplayEngine.replay(args.capsule)
+    verdict = ReplayEngine.replay(args.capsule, real_data_dir=args.data)
 
     print(f"[*] Experiment ID:       {verdict.experiment_id}")
     print(f"[*] Replay Status:       [{verdict.status.value}]")
@@ -139,7 +216,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     print("-" * 70)
     print(f"Diagnostic Details: {verdict.details}")
-    print("[i] Replay re-runs the simulated engine; a match shows determinism, not a reproduced model evaluation.")
+    print("[i] Replay re-runs the stored spec with the installed code; a match shows determinism")
+    print("    of that backend (simulated engine or local BM25), not an independent reproduction.")
     print("=" * 70)
 
     return 0 if verdict.is_passing() else 1
@@ -301,7 +379,9 @@ def cmd_attack_demo(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="DNA-Lang Evidence Workbench CLI (simulated retrieval)")
+    parser = argparse.ArgumentParser(
+        description="DNA-Lang Evidence Workbench CLI (simulated retrieval; run-real adds local BM25)"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # run
@@ -313,9 +393,30 @@ def main() -> int:
     p_run.add_argument("--experiment-id", type=str, default=None, help="Experiment identifier")
     p_run.add_argument("--out", type=str, default=None, help="Output capsule file path")
 
+    # run-real
+    p_real = subparsers.add_parser(
+        "run-real",
+        help="Run real BM25 retrieval over a local BEIR SciFact directory and create an evidence capsule",
+    )
+    p_real.add_argument(
+        "--data", type=str, required=True,
+        help="Path to a local BEIR SciFact directory (corpus.jsonl, queries.jsonl, qrels/test.tsv; nothing is downloaded)",
+    )
+    p_real.add_argument(
+        "--queries", type=_positive_int, default=None,
+        help="Number of queries to evaluate (default: all queries in the split)",
+    )
+    p_real.add_argument("--ceiling", type=int, default=1000, help="Maximum query ceiling")
+    p_real.add_argument("--experiment-id", type=str, default=None, help="Experiment identifier")
+    p_real.add_argument("--out", type=str, default=None, help="Output capsule file path")
+
     # replay
     p_rep = subparsers.add_parser("replay", help="Re-run a capsule's spec and compare the results")
     p_rep.add_argument("capsule", type=str, help="Path to .evidence.zip capsule")
+    p_rep.add_argument(
+        "--data", type=str, default=None,
+        help="BEIR SciFact directory, needed to replay capsules from the BM25 backend",
+    )
 
     # verify
     p_ver = subparsers.add_parser("verify", help="Check capsule files against the manifest checksums")
@@ -332,6 +433,8 @@ def main() -> int:
 
     if args.command == "run":
         return cmd_run(args)
+    elif args.command == "run-real":
+        return cmd_run_real(args)
     elif args.command == "replay":
         return cmd_replay(args)
     elif args.command == "verify":
