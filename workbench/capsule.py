@@ -34,7 +34,12 @@ _SUMMARY_LABELS = {
     "Ledger Chain Digest": "chain_digest",
     "Merkle Root": "chain_digest",
     "Retrieval Backend": "retrieval_backend",
+    "Model": "model_id",
+    "Model Label (not loaded)": "model_id",
+    "Dataset": "dataset",
+    "Dataset Label (placeholder queries)": "dataset",
 }
+_SUMMARY_TITLE = re.compile(r"^# DNA-Lang Evidence Capsule: (?P<value>.*?)\s*$")
 _SUMMARY_LINE = re.compile(r"^- \*\*(?P<label>[^*]+?):\*\* `?(?P<value>[^`]*?)`?\s*$")
 
 
@@ -46,6 +51,9 @@ class EvidenceCapsule:
         """Parse the figures in a capsule's summary.md into {field: value} strings."""
         fields: Dict[str, str] = {}
         for line in summary_md.splitlines():
+            title = _SUMMARY_TITLE.match(line.strip())
+            if title and "experiment_id" not in fields:
+                fields["experiment_id"] = title.group("value")
             m = _SUMMARY_LINE.match(line.strip())
             if m and m.group("label") in _SUMMARY_LABELS:
                 field, value = _SUMMARY_LABELS[m.group("label")], m.group("value").strip()
@@ -141,11 +149,11 @@ class EvidenceCapsule:
             raise ValueError("Invalid capsule: missing manifest.json")
 
         manifest = json.loads(contents["manifest.json"].decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("Invalid capsule: manifest.json is not a JSON object")
         # v1.0.0 capsules stored the chain digest under the old name
         if "chain_digest" not in manifest and "merkle_root" in manifest:
             manifest["chain_digest"] = manifest["merkle_root"]
-        if not isinstance(manifest, dict):
-            raise ValueError("Invalid capsule: manifest.json is not a JSON object")
         missing = [k for k in REQUIRED_MANIFEST_KEYS if k not in manifest]
         if missing:
             raise ValueError(f"Invalid capsule: manifest is missing {', '.join(missing)}")

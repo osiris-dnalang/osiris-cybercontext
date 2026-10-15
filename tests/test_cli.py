@@ -34,6 +34,20 @@ class CliTests(unittest.TestCase):
         self.assertIn("(not loaded)", proc.stdout)
         self.assertNotIn("Merkle", proc.stdout)
 
+    def test_demo_exits_non_zero_when_a_check_fails(self):
+        # Disable the regex layer: the adversarial turn is prose, so the AST layer can't catch it.
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from core.ast_firewall import CyberContextASTFirewall\n"
+            "CyberContextASTFirewall.DANGEROUS_SHELL_PATTERNS = []\n"
+            "import demo\n"
+            "sys.exit(demo.run_demo())\n"
+        ) % REPO_ROOT
+        proc = _run(["-c", script], cwd=REPO_ROOT)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("DEMO FAILED: 5/6 checks behaved as expected.", proc.stdout)
+        self.assertIn("unexpected: adversarial turn is flagged", proc.stdout)
+
     def test_attack_demo_builds_its_own_capsule_when_path_is_missing(self):
         proc = _run(["-m", "workbench.cli", "attack-demo", "benchmark_capsule.evidence.zip"], cwd=self.cwd)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

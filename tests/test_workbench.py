@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import warnings
 import zipfile
 
 from workbench.schema import ExperimentSpec, ExecutionPolicy, AuthorizationGrant, canonical_json_bytes, compute_sha256
@@ -199,6 +200,8 @@ class TestEvidenceWorkbench(unittest.TestCase):
         """A filler doc ID that collides with the planted relevant doc is counted once."""
         # Seed 285 produces such a collision for q-scifact-003.
         result = _execute(self._spec(query_count=10, random_seed=285))
+        self.assertEqual(result.evaluated_queries[2].retrieved_doc_ids.count("doc-scifact-102"), 2,
+                         "test premise: seed 285 must still produce the collision")
         for q in result.evaluated_queries:
             self.assertLessEqual(q.ndcg_at_10, 1.0, q.query_id)
             self.assertLessEqual(sum(q.relevance_scores), 1.0, q.query_id)
@@ -245,6 +248,115 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self._write_zip(path, files)
         return path
 
+    @staticmethod
+    def _set_file(files, manifest, name, data):
+        """Replace a capsule file and rewrite its checksum, as a forger would."""
+        files[name] = data
+        manifest["manifest_files"][name] = {"sha256": compute_sha256(data), "bytes": len(data)}
+
+    def _edit_summary(self, files, manifest, fn):
+        summary = fn(files["summary.md"].decode("utf-8"))
+        self._set_file(files, manifest, "summary.md", summary.encode("utf-8"))
+
+    def _replay_after(self, edit):
+        return ReplayEngine.replay(self._rewrite(edit))
+
+    def test_forged_chain_digest_alone_fails_replay(self):
+        def edit(files, manifest):
+            manifest["chain_digest"] = "0" * 64
+        verdict = self._replay_after(edit)
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertIn("chain digest differs", verdict.details)
+
+    def test_each_manifest_field_is_compared_with_the_replay(self):
+        def queries(files, manifest):
+            manifest["metrics"]["queries_evaluated"] = 5000
+
+        def blocks(files, manifest):
+            manifest["ledger_blocks_count"] = 99
+
+        def notice(files, manifest):
+            manifest["notice"] = ""
+
+        def experiment(files, manifest):
+            manifest["experiment_id"] = "EXP-OLMO3-REAL-RUN-REPRODUCED"
+
+        for edit, message in [
+            (queries, "manifest queries_evaluated 5000"),
+            (blocks, "manifest ledger_blocks_count 99"),
+            (notice, "manifest is missing the simulated-retrieval notice"),
+            (experiment, "manifest experiment_id 'EXP-OLMO3-REAL-RUN-REPRODUCED'"),
+        ]:
+            verdict = self._replay_after(edit)
+            self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED, edit.__name__)
+            self.assertIn(message, verdict.details, edit.__name__)
+            self.assertFalse(verdict.summary_verified, edit.__name__)
+
+    def test_each_summary_figure_is_compared_with_the_replay(self):
+        result = _execute(self._spec())
+        cases = [
+            ("mrr", f"**MRR@10:** {result.metrics['MRR@10']}", "**MRR@10:** 0.9", "summary.md MRR@10 0.9"),
+            ("chain", f"`{result.chain_digest}`", "`" + "a" * 64 + "`", "summary.md chain_digest"),
+            ("spec", f"`{result.spec_digest}`", "`" + "b" * 64 + "`", "summary.md spec_digest"),
+            ("model", "allenai/Olmo-3-7B-Instruct", "allenai/Olmo-3-7B-Instruct-REAL", "summary.md model_id"),
+            ("title", "Capsule: EXP-HONESTY", "Capsule: EXP-REAL", "summary.md experiment_id"),
+        ]
+        for name, old, new, message in cases:
+            def edit(files, manifest, old=old, new=new):
+                self._edit_summary(files, manifest, lambda text: text.replace(old, new, 1))
+            verdict = self._replay_after(edit)
+            self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED, name)
+            self.assertIn(message, verdict.details, name)
+
+    def test_summary_notice_alone_is_checked(self):
+        def edit(files, manifest):
+            self._edit_summary(files, manifest, lambda text: "\n".join(
+                line for line in text.splitlines() if not line.startswith("> ")))
+        verdict = self._replay_after(edit)
+        self.assertIn("summary.md is missing the simulated-retrieval notice", verdict.details)
+        self.assertNotIn("manifest is missing", verdict.details)
+
+    def test_missing_or_conflicting_summary_lines_are_reported(self):
+        def drop_line(files, manifest):
+            self._edit_summary(files, manifest, lambda text: "\n".join(
+                line for line in text.splitlines() if not line.startswith("- **MRR@10:**")))
+
+        def duplicate_line(files, manifest):
+            self._edit_summary(files, manifest, lambda text: text + "- **NDCG@10:** 0.9912\n")
+
+        self.assertIn("summary.md has no MRR@10", self._replay_after(drop_line).details)
+        self.assertIn("conflicting duplicate lines", self._replay_after(duplicate_line).details)
+
+    def test_missing_backend_label_is_tamper(self):
+        def edit(files, manifest):
+            del manifest["retrieval_backend"]
+        verdict = self._replay_after(edit)
+        self.assertEqual(verdict.status, ReplayStatus.TAMPER_DETECTED)
+        self.assertIn("no retrieval_backend label", verdict.details)
+
+    def test_truncated_records_with_rewritten_checksum_fail_replay(self):
+        def edit(files, manifest):
+            records = json.loads(files["raw_queries.json"])[:-1]
+            self._set_file(files, manifest, "raw_queries.json", canonical_json_bytes(records))
+        verdict = self._replay_after(edit)
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertIn("1 of 5 per-query records differ", verdict.details)
+
+    def test_policy_refusal_is_not_replayable(self):
+        def edit(files, manifest):
+            # Outside the canonical digest, so only the policy gate can object.
+            manifest["spec"]["execution_policy"]["require_authorization_grant"] = True
+        verdict = self._replay_after(edit)
+        self.assertEqual(verdict.status, ReplayStatus.NOT_REPLAYABLE)
+        self.assertIn("policy gate refused", verdict.details)
+
+    def test_spec_digest_mismatch_is_tamper(self):
+        def edit(files, manifest):
+            manifest["spec"]["random_seed"] = 43
+        verdict = self._replay_after(edit)
+        self.assertEqual(verdict.status, ReplayStatus.TAMPER_DETECTED)
+        self.assertIn("Canonical spec digest mismatch", verdict.details)
+
     def test_forged_chain_digest_fails_replay_even_with_metrics_nudged(self):
         def edit(files, manifest):
             manifest["chain_digest"] = "f" * 64
@@ -265,7 +377,8 @@ class TestEvidenceWorkbench(unittest.TestCase):
         EvidenceCapsule.pack(result, self.capsule_path)
         files = self._read_zip(self.capsule_path)
         path = os.path.join(self.tmp_dir.name, "dup.evidence.zip")
-        with zipfile.ZipFile(path, "w") as zf:
+        with warnings.catch_warnings(), zipfile.ZipFile(path, "w") as zf:
+            warnings.simplefilter("ignore", UserWarning)  # the duplicate is the point
             zf.writestr("raw_queries.json", b"[]")
             for name, data in files.items():
                 zf.writestr(name, data)
@@ -329,9 +442,31 @@ class TestEvidenceWorkbench(unittest.TestCase):
             files["raw_queries.json"] = b"5"
             manifest["manifest_files"]["raw_queries.json"] = {"sha256": compute_sha256(b"5"), "bytes": 1}
 
-        for edit in (drop_digest, drop_summary_checksum, add_file, records_not_a_list):
-            with self.assertRaises(ValueError, msg=edit.__name__):
+        def metrics_not_an_object(files, manifest):
+            manifest["metrics"] = [0.5]
+
+        for edit, message in [
+            (drop_digest, "manifest is missing chain_digest"),
+            (drop_summary_checksum, "manifest has no checksum for 'summary.md'"),
+            (add_file, "files not listed in the manifest: extra.txt"),
+            (records_not_a_list, "raw_queries.json is not a list of query records"),
+            (metrics_not_an_object, "manifest 'metrics' is not a JSON object"),
+        ]:
+            with self.assertRaises(ValueError, msg=edit.__name__) as caught:
                 EvidenceCapsule.unpack(self._rewrite(edit, f"{edit.__name__}.evidence.zip"))
+            self.assertIn(message, str(caught.exception), edit.__name__)
+
+    def test_unpack_rejects_a_manifest_that_is_not_an_object(self):
+        result = _execute(self._spec())
+        EvidenceCapsule.pack(result, self.capsule_path)
+        files = self._read_zip(self.capsule_path)
+        for bad in (b"5", b"null", b'["merkle_root"]', b"[]"):
+            files["manifest.json"] = bad
+            path = os.path.join(self.tmp_dir.name, "bad_manifest.evidence.zip")
+            self._write_zip(path, files)
+            with self.assertRaises(ValueError, msg=bad) as caught:
+                EvidenceCapsule.unpack(path)
+            self.assertIn("not a JSON object", str(caught.exception), bad)
 
     def test_metrics_at_10_ignore_ranks_beyond_10(self):
         result = _execute(self._spec(top_k=20, query_count=10, random_seed=7))
