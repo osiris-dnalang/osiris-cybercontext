@@ -42,6 +42,9 @@ TOY_CORPUS = {
     "doc-4": "alpha alpha unique four",
 }
 TOY_QUERIES = {"q-1": "alpha", "q-2": "gamma", "q-3": "delta"}
+# Listed in queries.jsonl but judged only in another split, as SciFact's train queries are.
+# It sorts first, so it would displace q-2 from a --queries 2 run if it were not filtered out.
+UNJUDGED_QUERIES = {"q-0": "alpha gamma"}
 TOY_QRELS = {
     "q-1": {"doc-4": 2, "doc-1": 1},
     "q-2": {"doc-3": 2},
@@ -68,7 +71,7 @@ def _write_toy_dataset(root: str) -> str:
         for doc_id, text in TOY_CORPUS.items():
             f.write(json.dumps({"_id": doc_id, "title": "", "text": text}) + "\n")
     with open(os.path.join(data_dir, "queries.jsonl"), "w", encoding="utf-8") as f:
-        for query_id, text in TOY_QUERIES.items():
+        for query_id, text in {**UNJUDGED_QUERIES, **TOY_QUERIES}.items():
             f.write(json.dumps({"_id": query_id, "text": text}) + "\n")
     with open(os.path.join(data_dir, "qrels", "test.tsv"), "w", encoding="utf-8") as f:
         f.write("query-id\tcorpus-id\tscore\n")
@@ -144,11 +147,20 @@ class TestRealScifactBackend(unittest.TestCase):
         self.assertEqual(telemetry["bm25_b"], BM25_B)
         self.assertEqual(telemetry["corpus_documents"], 4)
         self.assertEqual(telemetry["queries_in_split"], 3)
+        self.assertEqual(telemetry["queries_in_file"], 4)
 
     def test_query_count_selects_the_first_queries_in_sorted_id_order(self):
         result = run_real_scifact(_toy_spec(query_count=2), self.data_dir)
         self.assertEqual([q.query_id for q in result.evaluated_queries], ["q-1", "q-2"])
         self.assertEqual(result.metrics["queries_evaluated"], 2)
+
+    def test_queries_without_judgments_in_the_split_are_not_evaluated(self):
+        data = load_beir_dataset(self.data_dir)
+        self.assertEqual([q for q, _ in data.queries], ["q-1", "q-2", "q-3"])
+        self.assertEqual(data.queries_in_file, 4)
+        result = run_real_scifact(_toy_spec(query_count=5), self.data_dir)  # more than the 3 judged
+        self.assertNotIn("q-0", [q.query_id for q in result.evaluated_queries])
+        self.assertEqual(result.metrics["queries_evaluated"], 3)
 
     def test_two_runs_are_bit_for_bit_deterministic(self):
         first = run_real_scifact(_toy_spec(), self.data_dir)

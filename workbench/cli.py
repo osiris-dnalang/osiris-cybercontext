@@ -155,7 +155,7 @@ def cmd_run_real(args: argparse.Namespace) -> int:
     print(f"[*] Experiment ID:         {spec.experiment_id}")
     print(f"[*] Retrieval Backend:     {REAL_BACKEND}")
     print(f"[*] Corpus Documents:     {len(data.corpus)}")
-    print(f"[*] Queries in Split:      {len(data.queries)} (evaluating {queries})")
+    print(f"[*] Queries in Split:      {len(data.queries)} judged ({data.queries_in_file} in queries.jsonl; evaluating {queries})")
     print(f"[*] Dataset Directory:     {os.path.abspath(args.data)}")
     print(f"[*] Execution Mode:        {spec.execution_policy.mode}")
     print(f"[*] Canonical Spec Digest: {spec.canonical_digest()}")

@@ -19,11 +19,12 @@ weighting, so scores will differ. Treat the reference number as a sanity
 neighborhood, not a value this code reproduces; record your own capsule before
 making any comparison public.
 
-Queries are evaluated in sorted query-ID order and the first ``spec.query_count``
-of them are used (all of them when the count exceeds the split). Queries with
-no entry in the qrels are recorded but left out of the means, following the
-harness convention; on SciFact every test query has qrels, so this does not
-arise in practice.
+Only the split's judged queries are evaluated: the queries that appear in
+``qrels/<split>.tsv``. BEIR's ``queries.jsonl`` lists every query of every split
+(SciFact's also holds its train queries), and BEIR and MTEB score only the
+judged ones. They are evaluated in sorted query-ID order, and the first
+``spec.query_count`` of them are used (all of them when the count exceeds the
+split).
 """
 
 from __future__ import annotations
@@ -67,8 +68,9 @@ def tokenize(text: str) -> List[str]:
 @dataclass
 class SciFactData:
     corpus: Dict[str, str]                 # doc_id -> title + " " + text (raw)
-    queries: List[Tuple[str, str]]         # (query_id, query_text), sorted by ID
+    queries: List[Tuple[str, str]]         # judged queries of the split: (query_id, query_text), sorted by ID
     qrels: Dict[str, Dict[str, int]]       # query_id -> doc_id -> grade
+    queries_in_file: int = 0               # every query in queries.jsonl, judged or not
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -112,13 +114,12 @@ def load_beir_dataset(data_dir: str, split: str = "test") -> SciFactData:
         text = str(row.get("text", row.get("abstract", "")) or "")
         corpus[doc_id] = f"{title} {text}".strip()
 
-    queries: List[Tuple[str, str]] = []
+    all_queries: List[Tuple[str, str]] = []
     for row in _read_jsonl(queries_path):
         query_id = str(row.get("_id", "")).strip()
         if not query_id:
             raise ValueError(f"{queries_path} has a row with no '_id'")
-        queries.append((query_id, str(row.get("text", "") or "")))
-    queries.sort(key=lambda q: q[0])
+        all_queries.append((query_id, str(row.get("text", "") or "")))
 
     qrels: Dict[str, Dict[str, int]] = {}
     with open(qrels_path, encoding="utf-8") as f:
@@ -139,7 +140,9 @@ def load_beir_dataset(data_dir: str, split: str = "test") -> SciFactData:
                 raise ValueError(f"{qrels_path} line {lineno}: score {score!r} is not an integer")
             qrels.setdefault(query_id, {})[doc_id] = int(score)
 
-    return SciFactData(corpus=corpus, queries=queries, qrels=qrels)
+    # Keep only the queries this split judges; queries.jsonl also lists other splits' queries.
+    queries = sorted((q for q in all_queries if q[0] in qrels), key=lambda q: q[0])
+    return SciFactData(corpus=corpus, queries=queries, qrels=qrels, queries_in_file=len(all_queries))
 
 
 class BM25Index:
@@ -184,16 +187,21 @@ class BM25Index:
 
 
 def graded_ndcg_at_10(retrieved_ids: List[str], qrels_for_query: Dict[str, int], k: int = 10) -> float:
-    """Graded NDCG@k with 2^grade - 1 gains (SciFact qrels: 1 = related, 2 = supports)."""
+    """Graded NDCG@k with 2^grade - 1 gains.
+
+    BEIR's SciFact qrels are binary (every judgment is 1), so on SciFact this
+    equals binary NDCG; the grades matter for datasets with graded qrels.
+    """
     def gain(grade: int) -> float:
         return float(2 ** grade - 1)
 
+    # Discount 1 / log2(rank + 1): rank 1 counts fully.
     dcg = sum(
-        gain(qrels_for_query.get(doc_id, 0)) / math.log2(rank)
+        gain(qrels_for_query.get(doc_id, 0)) / math.log2(rank + 1)
         for rank, doc_id in enumerate(retrieved_ids[:k], start=1)
     )
     ideal = sorted(qrels_for_query.values(), reverse=True)[:k]
-    idcg = sum(gain(grade) / math.log2(rank) for rank, grade in enumerate(ideal, start=1))
+    idcg = sum(gain(grade) / math.log2(rank + 1) for rank, grade in enumerate(ideal, start=1))
     return (dcg / idcg) if idcg > 0 else 0.0
 
 
@@ -330,6 +338,7 @@ def run_real_scifact(
         "bm25_b": BM25_B,
         "corpus_documents": len(data.corpus),
         "queries_in_split": len(data.queries),
+        "queries_in_file": data.queries_in_file,
         "dataset_dir": os.path.abspath(data_dir),
     }
 
