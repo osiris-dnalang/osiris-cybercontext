@@ -119,32 +119,62 @@ class EvidenceWorkbenchEngine:
             "pid": os.getpid(),
         }
 
-        # Simulated corpus: placeholder claims, seeded pseudo-retrieval (see module docstring)
+        # Simulated corpus (multi-corpus benchmark simulation): placeholder claims, seeded pseudo-retrieval (see module docstring)
         rng = random.Random(spec.random_seed)
         query_records: List[QueryRecord] = []
         ndcg_list: List[float] = []
         mrr_list: List[float] = []
-
-        scifact_claims = [
-            ("q-scifact-001", "0-dimensional nanomaterials exhibit quantum dot confinement effect."),
-            ("q-scifact-002", "Activating transcription factor 3 suppresses lipopolysaccharide induced cytokine production."),
-            ("q-scifact-003", "ALDH1A1 expression correlates with poor clinical outcomes in clear cell renal carcinoma."),
-            ("q-scifact-004", "Alternative splicing of vascular endothelial growth factor modulates angiogenic potential."),
-            ("q-scifact-005", "Amylin receptor agonists reduce voluntary alcohol consumption in rodent models."),
-            ("q-scifact-006", "Apelin signaling stimulates myocardial capillary density and angiogenesis."),
-            ("q-scifact-007", "Autophagy activation preserves skeletal muscle mass during cancer cachexia."),
-            ("q-scifact-008", "Beta-catenin stabilization accelerates hematopoietic stem cell regeneration."),
-            ("q-scifact-009", "CD8+ T-cell exhaustion is reversible via dual checkpoint blockade."),
-            ("q-scifact-010", "Crispr-Cas9 off-target cleavage is minimized by high-fidelity engineered nucleases."),
-        ]
+        ds_lower = spec.dataset.lower()
+        if "nfcorpus" in ds_lower:
+            corpus_prefix = "nfcorpus"
+            corpus_claims = [
+                ("q-nfcorpus-001", "Dietary magnesium intake is inversely associated with systemic cardiovascular risk."),
+                ("q-nfcorpus-002", "Curcumin suppresses NF-kappaB activation and metastatic signaling in colon carcinoma."),
+                ("q-nfcorpus-003", "Anthocyanin-rich berry consumption improves insulin sensitivity in metabolic syndrome."),
+                ("q-nfcorpus-004", "Omega-3 polyunsaturated fatty acids attenuate inflammatory cytokine cascades."),
+                ("q-nfcorpus-005", "Sulforaphane induces phase II detoxification enzymes via Nrf2 nuclear translocation."),
+                ("q-nfcorpus-006", "High dietary fiber intake reduces systemic serum C-reactive protein concentrations."),
+                ("q-nfcorpus-007", "Zinc supplementation decreases incidence and duration of pediatric acute diarrhea."),
+                ("q-nfcorpus-008", "Polyphenol bioavailability depends on microbial conversion in the human distal gut."),
+                ("q-nfcorpus-009", "Vitamin D receptor polymorphisms modulate bone mineral density response to ergocalciferol."),
+                ("q-nfcorpus-010", "Resveratrol activates SIRT1 deacetylase pathway to improve endothelial function."),
+            ]
+        elif "cqadupstack" in ds_lower or "cqa" in ds_lower:
+            corpus_prefix = "cqa"
+            corpus_claims = [
+                ("q-cqa-001", "How to resolve dangling pointer errors in memory-constrained system runtimes?"),
+                ("q-cqa-002", "Optimal database indexing strategies for high-frequency append-only ledgers."),
+                ("q-cqa-003", "Mitigating quadratic attention bottlenecks in long-context transformer architectures."),
+                ("q-cqa-004", "Best practices for implementing fail-closed cryptographic token verification in microservices."),
+                ("q-cqa-005", "Configuring loopback socket IPC for low-latency hardware simulation on edge nodes."),
+                ("q-cqa-006", "Preventing AST prompt-injection escape vulnerabilities in LLM session memory pipelines."),
+                ("q-cqa-007", "How to compute deterministic Merkle roots over canonical RFC 8785 JSON blocks?"),
+                ("q-cqa-008", "Synchronizing distributed state machines across unstable hardware dock connections."),
+                ("q-cqa-009", "Debugging thermal throttling and frame-drop anomalies in real-time camera capture daemons."),
+                ("q-cqa-010", "Strategies for automated rollback recovery when write-ahead logs encounter torn-tail bytes."),
+            ]
+        else:
+            corpus_prefix = "scifact"
+            corpus_claims = [
+                ("q-scifact-001", "0-dimensional nanomaterials exhibit quantum dot confinement effect."),
+                ("q-scifact-002", "Activating transcription factor 3 suppresses lipopolysaccharide induced cytokine production."),
+                ("q-scifact-003", "ALDH1A1 expression correlates with poor clinical outcomes in clear cell renal carcinoma."),
+                ("q-scifact-004", "Alternative splicing of vascular endothelial growth factor modulates angiogenic potential."),
+                ("q-scifact-005", "Amylin receptor agonists reduce voluntary alcohol consumption in rodent models."),
+                ("q-scifact-006", "Apelin signaling stimulates myocardial capillary density and angiogenesis."),
+                ("q-scifact-007", "Autophagy activation preserves skeletal muscle mass during cancer cachexia."),
+                ("q-scifact-008", "Beta-catenin stabilization accelerates hematopoietic stem cell regeneration."),
+                ("q-scifact-009", "CD8+ T-cell exhaustion is reversible via dual checkpoint blockade."),
+                ("q-scifact-010", "Crispr-Cas9 off-target cleavage is minimized by high-fidelity engineered nucleases."),
+            ]
 
         # Use spec.query_count queries (cycled or sampled deterministically)
         for i in range(spec.query_count):
-            qid, claim_text = scifact_claims[i % len(scifact_claims)]
+            qid, claim_text = corpus_claims[i % len(corpus_claims)]
             # Seeded pseudo-retrieval results
-            retrieved_docs = [f"doc-scifact-{rng.randint(100, 999)}" for _ in range(spec.top_k)]
+            retrieved_docs = [f"doc-{corpus_prefix}-{rng.randint(100, 999)}" for _ in range(spec.top_k)]
             # Relevant document planted deterministically
-            relevant_doc = f"doc-scifact-{100 + (i % 7)}"
+            relevant_doc = f"doc-{corpus_prefix}-{100 + (i % 7)}"
             rel_rank = rng.randint(1, spec.top_k + 2)
             if rel_rank <= spec.top_k:
                 retrieved_docs[rel_rank - 1] = relevant_doc
