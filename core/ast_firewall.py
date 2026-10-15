@@ -6,10 +6,13 @@ checks in order:
 1. A regex deny-list over the raw text (``; rm -rf``, backticks, ``$(...)``,
    ``/etc/passwd``, ``/etc/shadow``, ``.env``). Most mixed prose-and-code turns
    are caught here, if at all. It also flags harmless text that happens to
-   match, such as any mention of a ``.env`` file.
-2. If the whole turn parses as Python, an AST walk that flags calls to
-   ``exec``, ``eval``, ``compile`` and ``__import__``, and the dotted calls in
-   FORBIDDEN_MODULES (``os.system``, ``subprocess.run`` and so on). A turn that
+   match: any pair of backticks (Markdown inline code), any ``$(...)``, and any
+   mention of a ``.env`` file.
+2. If the whole turn parses as Python, an AST walk that flags calls to the
+   builtins ``exec``, ``eval``, ``compile`` and ``__import__`` (called by bare
+   name or as ``builtins.<name>``), and the dotted calls in FORBIDDEN_MODULES
+   (``os.system``, ``subprocess.run`` and so on). Methods that share a name,
+   such as ``model.eval()`` or ``re.compile()``, are not flagged. A turn that
    does not parse as Python skips this check.
 
 Obfuscated payloads get through: string-built names
@@ -28,7 +31,7 @@ from typing import Optional
 
 
 class ASTFirewallViolation(RuntimeError):
-    """Raised when an unverified or dangerous payload is caught."""
+    """Exception for callers that want to raise on a flagged turn (not raised by this module)."""
     pass
 
 
@@ -88,40 +91,33 @@ class CyberContextASTFirewall:
                     detection_layer="regex",
                 )
 
-        # 2. If content looks like python code, parse AST
-        if any(kw in content for kw in ["import ", "def ", "class ", "exec(", "eval("]):
-            try:
-                tree = ast.parse(content)
-                node_count = len(list(ast.walk(tree)))
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Call):
-                        func_name = ""
-                        if isinstance(node.func, ast.Name):
-                            func_name = node.func.id
-                        elif isinstance(node.func, ast.Attribute):
-                            func_name = node.func.attr
+        # 2. If the whole turn parses as Python, walk the AST
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            # Not Python (natural-language text, other languages, null bytes)
+            return SanitizedTurn(raw_content=content, is_safe=True, ast_nodes_count=0)
 
-                        if func_name in cls.FORBIDDEN_CALLS:
-                            return SanitizedTurn(
-                                raw_content=content,
-                                is_safe=False,
-                                quarantine_reason=f"Forbidden dynamic evaluation primitive: '{func_name}()'",
-                                ast_nodes_count=node_count,
-                                detection_layer="ast",
-                            )
-
-                        dotted = _dotted_name(node.func)
-                        if dotted in cls.FORBIDDEN_MODULES:
-                            return SanitizedTurn(
-                                raw_content=content,
-                                is_safe=False,
-                                quarantine_reason=f"Forbidden system call: '{dotted}()'",
-                                ast_nodes_count=node_count,
-                                detection_layer="ast",
-                            )
-                return SanitizedTurn(raw_content=content, is_safe=True, ast_nodes_count=node_count)
-            except SyntaxError:
-                # Natural-language text that happens to contain Python keywords
-                pass
-
-        return SanitizedTurn(raw_content=content, is_safe=True, ast_nodes_count=0)
+        node_count = len(list(ast.walk(tree)))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            dotted = _dotted_name(node.func)
+            builtin_name = dotted[len("builtins."):] if dotted.startswith("builtins.") else dotted
+            if builtin_name in cls.FORBIDDEN_CALLS:
+                return SanitizedTurn(
+                    raw_content=content,
+                    is_safe=False,
+                    quarantine_reason=f"Forbidden dynamic evaluation primitive: '{builtin_name}()'",
+                    ast_nodes_count=node_count,
+                    detection_layer="ast",
+                )
+            if dotted in cls.FORBIDDEN_MODULES:
+                return SanitizedTurn(
+                    raw_content=content,
+                    is_safe=False,
+                    quarantine_reason=f"Forbidden system call: '{dotted}()'",
+                    ast_nodes_count=node_count,
+                    detection_layer="ast",
+                )
+        return SanitizedTurn(raw_content=content, is_safe=True, ast_nodes_count=node_count)

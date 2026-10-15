@@ -1,10 +1,16 @@
 """Ledger-backed scoring helper for MTEB / BEIR-style retrieval benchmarks.
 
 This module does not load or run any model, Olmo 3 included. You pass in
-queries with their relevant document IDs and the rankings a retriever produced;
+queries with their relevant document IDs and the results a retriever returned;
 it computes NDCG@10 and MRR@10 and appends one block per batch to the evidence
 ledger. That block holds the aggregate metrics, the model label and the dataset
 name. It does not record individual document IDs or embeddings.
+
+Scoring follows the usual BEIR / pytrec_eval conventions with two limits:
+results are ranked by score, highest first (ties keep the order given, whereas
+trec_eval breaks ties by document ID); relevance is binary (graded qrels such
+as NFCorpus or TREC-COVID are not supported); and queries with no relevant
+documents are left out of the means.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ class BatchMetrics:
     mean_ndcg_at_10: float
     mean_mrr_at_10: float
     corpus_task_complexity_score: float
+    scored_queries: int = 0  # queries with at least one relevant document
 
 
 class Olmo3BenchmarkHarness:
@@ -42,7 +49,7 @@ class Olmo3BenchmarkHarness:
     ``model_name`` is a label stored with the result; nothing is loaded.
     """
 
-    def __init__(self, ledger: EvidenceLedger, model_name: str = "allenai/Olmo-3-7B"):
+    def __init__(self, ledger: EvidenceLedger, model_name: str = "allenai/Olmo-3-7B-Instruct"):
         self.ledger = ledger
         self.model_name = model_name
 
@@ -58,8 +65,9 @@ class Olmo3BenchmarkHarness:
     def evaluate_query(
         cls, query: RetrievalQuery, retrieved: List[RetrievedResult], k: int = 10
     ) -> Tuple[float, float]:
-        """Computes NDCG@k and MRR@k for a single retrieval turn."""
+        """Computes NDCG@k and MRR@k for one query, ranking results by score (highest first)."""
         rel_set = set(query.relevant_doc_ids)
+        retrieved = sorted(retrieved, key=lambda r: r.score, reverse=True)  # stable: ties keep order
         # A relevant document counts once, at its first rank; repeats score 0.
         seen = set()
         binary_rel = []
@@ -96,6 +104,8 @@ class Olmo3BenchmarkHarness:
         mrr_list = []
 
         for q in queries:
+            if not q.relevant_doc_ids:
+                continue  # no relevant documents: NDCG is undefined, so leave the query out
             retrieved = ranking_results.get(q.query_id, [])
             ndcg, mrr = self.evaluate_query(q, retrieved, k=10)
             ndcg_list.append(ndcg)
@@ -111,6 +121,7 @@ class Olmo3BenchmarkHarness:
             "model": self.model_name,
             "dataset": dataset_name,
             "queries_evaluated": len(queries),
+            "queries_scored": len(ndcg_list),
             "ndcg_at_10": round(mean_ndcg, 4),
             "mrr_at_10": round(mean_mrr, 4),
             "corpus_task_complexity": ctc_score,
@@ -129,4 +140,5 @@ class Olmo3BenchmarkHarness:
             mean_ndcg_at_10=round(mean_ndcg, 4),
             mean_mrr_at_10=round(mean_mrr, 4),
             corpus_task_complexity_score=ctc_score,
+            scored_queries=len(ndcg_list),
         )

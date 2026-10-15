@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -60,7 +60,8 @@ class AuthorizationGrant:
 
 @dataclass
 class ExecutionPolicy:
-    """Enforceable operational policy and resource limits."""
+    """Execution policy. The engine checks max_query_ceiling and, for REMOTE_DISPATCH,
+    the grant; timeout_seconds is recorded but not enforced."""
     mode: str = "LOCAL_BOUNDED"  # "LOCAL_BOUNDED" or "REMOTE_DISPATCH"
     max_query_ceiling: int = 100
     timeout_seconds: float = 300.0
@@ -86,7 +87,9 @@ class ExperimentSpec:
     random_seed: int = 42
     target_metrics: List[str] = field(default_factory=lambda: ["NDCG@10", "MRR@10", "CTC"])
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
-    created_at_iso: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_at_iso: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert specification to structured dict."""

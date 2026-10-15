@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import zipfile
 from dataclasses import asdict
 from typing import Any, Dict
@@ -19,8 +20,39 @@ from .engine import ExecutionResult, RETRIEVAL_BACKEND, SIMULATION_NOTICE
 from .schema import canonical_json_bytes, ExperimentSpec
 
 
+REQUIRED_MANIFEST_KEYS = ("experiment_id", "spec_digest", "chain_digest", "metrics", "spec", "manifest_files")
+CHECKSUMMED_FILES = ("raw_queries.json", "summary.md")
+
+# summary.md bullet labels -> field names (v1.0.0 labels included)
+_SUMMARY_LABELS = {
+    "NDCG@10": "NDCG@10",
+    "MRR@10": "MRR@10",
+    "CTC (derived score)": "CTC",
+    "Corpus Task Complexity": "CTC",
+    "Queries Evaluated": "queries_evaluated",
+    "Canonical Spec Digest": "spec_digest",
+    "Ledger Chain Digest": "chain_digest",
+    "Merkle Root": "chain_digest",
+    "Retrieval Backend": "retrieval_backend",
+}
+_SUMMARY_LINE = re.compile(r"^- \*\*(?P<label>[^*]+?):\*\* `?(?P<value>[^`]*?)`?\s*$")
+
+
 class EvidenceCapsule:
     """Manages creation, serialization, and inspection of evidence capsules."""
+
+    @staticmethod
+    def summary_fields(summary_md: str) -> Dict[str, str]:
+        """Parse the figures in a capsule's summary.md into {field: value} strings."""
+        fields: Dict[str, str] = {}
+        for line in summary_md.splitlines():
+            m = _SUMMARY_LINE.match(line.strip())
+            if m and m.group("label") in _SUMMARY_LABELS:
+                field, value = _SUMMARY_LABELS[m.group("label")], m.group("value").strip()
+                if fields.get(field, value) != value:
+                    value = "<conflicting duplicate lines>"
+                fields[field] = value
+        return fields
 
     @staticmethod
     def pack(result: ExecutionResult, output_path: str) -> str:
@@ -85,18 +117,24 @@ class EvidenceCapsule:
     def unpack(capsule_path: str) -> Dict[str, Any]:
         """Unpack a capsule and check each file against the checksums in its manifest.
 
-        This catches corruption and edits that don't also update the manifest.
-        The manifest itself is unsigned, so someone who edits a file and
-        rewrites its checksum produces a capsule that passes this check.
-        ReplayEngine.replay re-runs the spec and compares the records; proving
-        who produced a capsule would need a signature.
+        This catches corruption, edits to a listed file that don't also update
+        the manifest, files missing from or added to the capsule, and duplicate
+        file names. It does
+        not check manifest.json itself: its metrics, spec and labels can be
+        edited freely, and someone who edits a file and rewrites its checksum
+        produces a capsule that passes. ReplayEngine.replay re-runs the spec and
+        compares the results; proving who produced a capsule would need a
+        signature.
         """
         if not os.path.exists(capsule_path):
             raise FileNotFoundError(f"Evidence capsule not found: {capsule_path}")
 
         contents = {}
         with zipfile.ZipFile(capsule_path, "r") as zf:
-            for name in zf.namelist():
+            names = zf.namelist()
+            if len(names) != len(set(names)):
+                raise ValueError("Invalid capsule: duplicate file names in the zip")
+            for name in names:
                 contents[name] = zf.read(name)
 
         if "manifest.json" not in contents:
@@ -106,9 +144,23 @@ class EvidenceCapsule:
         # v1.0.0 capsules stored the chain digest under the old name
         if "chain_digest" not in manifest and "merkle_root" in manifest:
             manifest["chain_digest"] = manifest["merkle_root"]
+        if not isinstance(manifest, dict):
+            raise ValueError("Invalid capsule: manifest.json is not a JSON object")
+        missing = [k for k in REQUIRED_MANIFEST_KEYS if k not in manifest]
+        if missing:
+            raise ValueError(f"Invalid capsule: manifest is missing {', '.join(missing)}")
+        for key in ("metrics", "spec", "manifest_files"):
+            if not isinstance(manifest[key], dict):
+                raise ValueError(f"Invalid capsule: manifest '{key}' is not a JSON object")
 
         # Verify internal file integrity
-        manifest_files = manifest.get("manifest_files", {})
+        manifest_files = manifest["manifest_files"]
+        for fname in CHECKSUMMED_FILES:
+            if fname not in manifest_files:
+                raise ValueError(f"Invalid capsule: manifest has no checksum for '{fname}'")
+        unlisted = sorted(set(contents) - set(manifest_files) - {"manifest.json"})
+        if unlisted:
+            raise ValueError(f"Invalid capsule: files not listed in the manifest: {', '.join(unlisted)}")
         for fname, meta in manifest_files.items():
             if fname not in contents:
                 raise ValueError(f"Corrupted capsule: manifest references missing file '{fname}'")
@@ -118,8 +170,11 @@ class EvidenceCapsule:
                     f"Tamper detected in capsule file '{fname}': expected {meta['sha256'][:16]}, found {actual_sha[:16]}"
                 )
 
+        raw_queries = json.loads(contents["raw_queries.json"].decode("utf-8"))
+        if not isinstance(raw_queries, list) or not all(isinstance(r, dict) for r in raw_queries):
+            raise ValueError("Invalid capsule: raw_queries.json is not a list of query records")
         return {
             "manifest": manifest,
-            "raw_queries": json.loads(contents["raw_queries.json"].decode("utf-8")),
+            "raw_queries": raw_queries,
             "summary_md": contents["summary.md"].decode("utf-8"),
         }

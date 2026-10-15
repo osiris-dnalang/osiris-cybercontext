@@ -2,12 +2,18 @@
 
 Zero-dependency append-only log used by the demo and the evidence workbench.
 
-What verify_integrity() detects: a block edited in place without recomputing
-its hash and every later hash (for example a direct SQL UPDATE of one row), and
-gaps or re-ordering in the sequence.
+What verify_integrity() detects: most edits to a stored block that don't also
+recompute its hash and every later hash (for example a direct SQL UPDATE of a
+metric), and deleted or re-ordered blocks before the newest one.
 
-What it does not detect: anyone with write access to the database can rewrite a
-block and recompute the rest of the chain, and the result verifies as intact.
+What it does not detect:
+- Deleting the newest block(s), or all of them: no head hash or block count is
+  stored anywhere else to compare with.
+- Timestamp edits smaller than 1e-4 s, because the hash covers the timestamp
+  rounded to 4 decimals, and edits that move text across the ':' separators
+  between hashed fields.
+- A rewrite of any block followed by recomputing the rest of the chain, which
+  anyone with write access to the database can do.
 There is no signature and no external anchor, so a passing check means "this
 file is internally consistent", not "this history is authentic".
 """
@@ -137,6 +143,8 @@ class EvidenceLedger:
                 return False, f"Sequence break: expected #{idx}, got #{row['entry_id']}"
             if row["prev_hash"] != expected_prev:
                 return False, f"Chain linkage break at block #{idx}"
+            if not isinstance(row["timestamp"], (int, float)):
+                return False, f"Malformed block #{idx}: timestamp is not a number"
 
             preimage = f"{row['prev_hash']}:{row['entry_id']}:{row['timestamp']:.4f}:{row['domain']}:{row['action']}:{row['payload_digest']}:{row['metric_json']}"
             recomputed = compute_sha256(preimage)

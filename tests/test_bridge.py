@@ -3,15 +3,19 @@
 import math
 import platform
 import unittest
+from unittest import mock
 from core.ledger import EvidenceLedger
 from core.ast_firewall import CyberContextASTFirewall
 from core.benchmark_harness import Olmo3BenchmarkHarness, RetrievalQuery, RetrievedResult
-from core.hardware_mesh import TandemoniumSubstrateBridge, DeviceEvent, parse_cpu_features
+from core.hardware_mesh import SubstrateType, TandemoniumSubstrateBridge, DeviceEvent, parse_cpu_features
 
 
 class IntegrationBridgeTests(unittest.TestCase):
     def setUp(self):
         self.ledger = EvidenceLedger(":memory:")
+
+    def tearDown(self):
+        self.ledger.close()
 
     def test_ledger_append_and_integrity_check(self):
         rec1 = self.ledger.append("TEST", "ACTION_1", {"key": "val1"})
@@ -23,6 +27,13 @@ class IntegrationBridgeTests(unittest.TestCase):
         is_valid, msg = self.ledger.verify_integrity()
         self.assertTrue(is_valid)
         self.assertIn("All 2 blocks verified", msg)
+
+    def test_ledger_reports_a_malformed_timestamp_instead_of_crashing(self):
+        self.ledger.append("TEST", "A", {"k": 1})
+        self.ledger.conn.execute("UPDATE ledger SET timestamp = 'yesterday' WHERE entry_id = 1")
+        ok, msg = self.ledger.verify_integrity()
+        self.assertFalse(ok)
+        self.assertIn("Malformed block #1", msg)
 
     def test_ast_firewall_blocks_injection_and_allows_safe_code(self):
         safe_text = "def calculate_fitness(x): return x * 2"
@@ -79,6 +90,24 @@ class IntegrationBridgeTests(unittest.TestCase):
         self.assertAlmostEqual(ndcg, 1.0 / (1.0 + 1.0 / math.log2(3)))
         self.assertEqual(mrr, 1.0)
 
+    def test_results_are_ranked_by_score_not_list_order(self):
+        query = RetrievalQuery(query_id="q1", query_text="t", relevant_doc_ids=["d1"])
+        ndcg, mrr = Olmo3BenchmarkHarness.evaluate_query(
+            query, [RetrievedResult("d2", 0.1), RetrievedResult("d3", 0.2), RetrievedResult("d1", 0.9)]
+        )
+        self.assertEqual((ndcg, mrr), (1.0, 1.0))
+
+    def test_queries_without_relevant_docs_are_left_out_of_the_means(self):
+        harness = Olmo3BenchmarkHarness(self.ledger)
+        queries = [
+            RetrievalQuery(query_id="q1", query_text="t", relevant_doc_ids=["d1"]),
+            RetrievalQuery(query_id="q2", query_text="t", relevant_doc_ids=[]),
+        ]
+        metrics = harness.evaluate_batch("test", queries, {"q1": [RetrievedResult("d1", 1.0)]})
+        self.assertEqual(metrics.total_queries, 2)
+        self.assertEqual(metrics.scored_queries, 1)
+        self.assertEqual(metrics.mean_ndcg_at_10, 1.0)
+
     def test_ndcg_counts_a_repeated_relevant_doc_once(self):
         query = RetrievalQuery(query_id="q1", query_text="t", relevant_doc_ids=["d1"])
         ndcg, _ = Olmo3BenchmarkHarness.evaluate_query(
@@ -100,11 +129,49 @@ class IntegrationBridgeTests(unittest.TestCase):
 
         self.assertIsNone(CyberContextASTFirewall.sanitize_turn("plain text").detection_layer)
 
+    def test_firewall_checks_bare_calls_with_no_keyword(self):
+        # Valid Python with no "import"/"def"/"exec(" keyword used to skip the AST check.
+        for turn, reason in [
+            ('os.system("ls -la /")', "os.system"),
+            ('subprocess.run(["rm", "-r", "/tmp/x"])', "subprocess.run"),
+            ('__import__("os").system("id")', "__import__"),
+            ('builtins.eval("1 + 1")', "eval"),
+        ]:
+            res = CyberContextASTFirewall.sanitize_turn(turn)
+            self.assertFalse(res.is_safe, turn)
+            self.assertEqual(res.detection_layer, "ast", turn)
+            self.assertIn(reason, res.quarantine_reason, turn)
+
+    def test_firewall_ignores_methods_named_like_builtins(self):
+        for turn in ["import torch\nmodel.eval()", 'import re\npattern = re.compile("a+")']:
+            self.assertTrue(CyberContextASTFirewall.sanitize_turn(turn).is_safe, turn)
+
     def test_substrate_profile_reports_the_actual_host(self):
         profile = TandemoniumSubstrateBridge.detect_host_substrate()
         self.assertEqual(profile.machine, platform.machine())
         self.assertEqual(profile.system, platform.system())
-        self.assertNotEqual(profile.substrate.value, "workstation_intel_core_ultra")
+
+    def test_substrate_classification(self):
+        termux = {"PREFIX": "/data/data/com.termux/files/usr"}
+        cases = [
+            ("Linux", "x86_64", {}, SubstrateType.WORKSTATION),
+            ("Windows", "AMD64", {}, SubstrateType.WORKSTATION),
+            ("Linux", "aarch64", termux, SubstrateType.MOBILE_EDGE),
+            ("Linux", "aarch64", {}, SubstrateType.ARM_HOST),
+            ("Darwin", "arm64", {}, SubstrateType.ARM_HOST),
+            ("Linux", "i686", {}, SubstrateType.UNKNOWN),
+        ]
+        for system, machine, env, expected in cases:
+            with mock.patch("platform.system", return_value=system), \
+                    mock.patch("platform.machine", return_value=machine), \
+                    mock.patch.dict("os.environ", env, clear=True), \
+                    mock.patch("core.hardware_mesh._read_cpu_features", return_value=["AVX2"]):
+                profile = TandemoniumSubstrateBridge.detect_host_substrate()
+            self.assertEqual(profile.substrate, expected, (system, machine, env))
+            if system == "Linux":
+                self.assertEqual(profile.hardware_acceleration, "AVX2")
+            else:
+                self.assertIn("not checked", profile.hardware_acceleration)
 
     def test_parse_cpu_features(self):
         x86 = "processor\t: 0\nflags\t\t: fpu sse sse2 avx2 avx_vnni\n"

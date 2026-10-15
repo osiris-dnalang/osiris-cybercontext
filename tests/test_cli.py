@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,7 +30,7 @@ class CliTests(unittest.TestCase):
         proc = _run([os.path.join(REPO_ROOT, "demo.py")], cwd=REPO_ROOT)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DEMO COMPLETE: 6/6 checks behaved as expected.", proc.stdout)
-        self.assertIn("[BLOCKED] by the regex layer", proc.stdout)
+        self.assertIn("[FLAGGED] by the regex layer", proc.stdout)
         self.assertIn("(not loaded)", proc.stdout)
         self.assertNotIn("Merkle", proc.stdout)
 
@@ -51,6 +52,48 @@ class CliTests(unittest.TestCase):
             proc = _run(["-m", "workbench.cli", command, capsule], cwd=self.cwd)
             self.assertEqual(proc.returncode, 0, f"{command}:\n{proc.stdout}{proc.stderr}")
         self.assertEqual(sorted(os.listdir(self.cwd)), [capsule])
+
+    def test_attack_demo_reports_all_three_attacks(self):
+        proc = _run(["-m", "workbench.cli", "attack-demo"], cwd=self.cwd)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("[Attack 3]", proc.stdout)
+        self.assertEqual(proc.stdout.count("replay: DETECTED"), 2, proc.stdout)
+
+    def test_attack_demo_refuses_a_capsule_that_is_already_broken(self):
+        capsule = os.path.join(self.cwd, "c.evidence.zip")
+        self.assertEqual(_run(["-m", "workbench.cli", "run", "--out", capsule], cwd=self.cwd).returncode, 0)
+        with zipfile.ZipFile(capsule) as zf:
+            files = {n: zf.read(n) for n in zf.namelist()}
+        files["summary.md"] += b"x"
+        broken = os.path.join(self.cwd, "broken.evidence.zip")
+        with zipfile.ZipFile(broken, "w") as zf:
+            for n, data in files.items():
+                zf.writestr(n, data)
+        proc = _run(["-m", "workbench.cli", "attack-demo", broken], cwd=self.cwd)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("does not pass replay", proc.stdout)
+
+    def test_run_rejects_fewer_than_one_query(self):
+        for n in ("0", "-3"):
+            proc = _run(["-m", "workbench.cli", "run", "--queries", n, "--out", "x.evidence.zip"], cwd=self.cwd)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(os.listdir(self.cwd), [])
+
+    def test_attack_demo_with_zero_records_exits_2(self):
+        # The CLI refuses --queries 0, so build the empty capsule through the API.
+        if REPO_ROOT not in sys.path:
+            sys.path.insert(0, REPO_ROOT)
+        from workbench.capsule import EvidenceCapsule
+        from workbench.engine import EvidenceWorkbenchEngine
+        from workbench.schema import ExperimentSpec
+        engine = EvidenceWorkbenchEngine()
+        result = engine.execute(ExperimentSpec(
+            experiment_id="EMPTY", model_id="m", benchmark_suite="b", dataset="d", split="t", query_count=0,
+        ))
+        engine.ledger.close()
+        capsule = EvidenceCapsule.pack(result, os.path.join(self.cwd, "zero.evidence.zip"))
+        proc = _run(["-m", "workbench.cli", "attack-demo", capsule], cwd=self.cwd)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
 
     def test_verify_and_replay_report_a_missing_capsule_as_missing(self):
         for command in ("verify", "replay"):

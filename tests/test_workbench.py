@@ -16,6 +16,15 @@ from workbench.capsule import EvidenceCapsule
 from workbench.replay import ReplayEngine, ReplayStatus
 
 
+def _execute(spec):
+    """Run a spec in a fresh engine and close its in-memory ledger."""
+    engine = EvidenceWorkbenchEngine()
+    try:
+        return engine.execute(spec)
+    finally:
+        engine.ledger.close()
+
+
 class TestEvidenceWorkbench(unittest.TestCase):
     """Test suite for DNA-Lang Evidence Workbench."""
 
@@ -27,7 +36,7 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_canonical_spec_digest(self):
-        """Verify RFC 8785 canonical specification digest is deterministic."""
+        """Verify the canonical specification digest is deterministic."""
         spec1 = ExperimentSpec(
             experiment_id="EXP-001",
             model_id="allenai/Olmo-3-7B-Instruct",
@@ -59,6 +68,7 @@ class TestEvidenceWorkbench(unittest.TestCase):
             random_seed=123,
         )
         engine = EvidenceWorkbenchEngine()
+        self.addCleanup(engine.ledger.close)
         result = engine.execute(spec)
 
         self.assertEqual(result.metrics["queries_evaluated"], 5)
@@ -91,6 +101,7 @@ class TestEvidenceWorkbench(unittest.TestCase):
             execution_policy=ExecutionPolicy(mode="REMOTE_DISPATCH", require_authorization_grant=True),
         )
         engine = EvidenceWorkbenchEngine()
+        self.addCleanup(engine.ledger.close)
 
         with self.assertRaises(GovernanceAuthorizationViolation):
             engine.execute(spec)
@@ -123,11 +134,12 @@ class TestEvidenceWorkbench(unittest.TestCase):
             execution_policy=ExecutionPolicy(max_query_ceiling=50),
         )
         engine = EvidenceWorkbenchEngine()
+        self.addCleanup(engine.ledger.close)
         with self.assertRaises(QuotaExceededViolation):
             engine.execute(spec)
 
     def test_capsule_tamper_detection(self):
-        """Verify that single-byte file alteration in capsule is immediately caught."""
+        """Verify that editing a capsule file without updating its checksum is caught."""
         spec = ExperimentSpec(
             experiment_id="EXP-TAMPER-TEST",
             model_id="allenai/Olmo-3-7B-Instruct",
@@ -137,6 +149,7 @@ class TestEvidenceWorkbench(unittest.TestCase):
             query_count=3,
         )
         engine = EvidenceWorkbenchEngine()
+        self.addCleanup(engine.ledger.close)
         result = engine.execute(spec)
         EvidenceCapsule.pack(result, self.capsule_path)
 
@@ -185,13 +198,13 @@ class TestEvidenceWorkbench(unittest.TestCase):
     def test_simulated_ndcg_never_exceeds_one(self):
         """A filler doc ID that collides with the planted relevant doc is counted once."""
         # Seed 285 produces such a collision for q-scifact-003.
-        result = EvidenceWorkbenchEngine().execute(self._spec(query_count=10, random_seed=285))
+        result = _execute(self._spec(query_count=10, random_seed=285))
         for q in result.evaluated_queries:
             self.assertLessEqual(q.ndcg_at_10, 1.0, q.query_id)
             self.assertLessEqual(sum(q.relevance_scores), 1.0, q.query_id)
 
     def test_capsule_records_that_retrieval_is_simulated(self):
-        result = EvidenceWorkbenchEngine().execute(self._spec())
+        result = _execute(self._spec())
         EvidenceCapsule.pack(result, self.capsule_path)
         data = EvidenceCapsule.unpack(self.capsule_path)
         self.assertEqual(data["manifest"]["retrieval_backend"], "simulated-seeded-rng")
@@ -201,7 +214,7 @@ class TestEvidenceWorkbench(unittest.TestCase):
 
     def test_rehashed_forgery_passes_checksums_but_fails_replay(self):
         """Editing a record and rewriting its checksum fools verify, not replay."""
-        result = EvidenceWorkbenchEngine().execute(self._spec())
+        result = _execute(self._spec())
         EvidenceCapsule.pack(result, self.capsule_path)
         files = self._read_zip(self.capsule_path)
 
@@ -220,8 +233,116 @@ class TestEvidenceWorkbench(unittest.TestCase):
         self.assertFalse(verdict.records_verified)
         self.assertIn("per-query records differ", verdict.details)
 
+    def _rewrite(self, edit, name="edited.evidence.zip"):
+        """Pack a fresh capsule, let ``edit(files, manifest)`` change it, and write the result."""
+        result = _execute(self._spec())
+        EvidenceCapsule.pack(result, self.capsule_path)
+        files = self._read_zip(self.capsule_path)
+        manifest = json.loads(files["manifest.json"])
+        edit(files, manifest)
+        files["manifest.json"] = canonical_json_bytes(manifest)
+        path = os.path.join(self.tmp_dir.name, name)
+        self._write_zip(path, files)
+        return path
+
+    def test_forged_chain_digest_fails_replay_even_with_metrics_nudged(self):
+        def edit(files, manifest):
+            manifest["chain_digest"] = "f" * 64
+            manifest["metrics"]["CTC"] += 5e-5
+        verdict = ReplayEngine.replay(self._rewrite(edit))
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertFalse(verdict.chain_digest_verified)
+
+    def test_simulated_capsule_metrics_must_match_exactly(self):
+        def edit(files, manifest):
+            manifest["metrics"]["NDCG@10"] += 9e-5  # within the default 1e-4 tolerance
+        verdict = ReplayEngine.replay(self._rewrite(edit))
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertIn("metric drift", verdict.details)
+
+    def test_unpack_rejects_duplicate_zip_entries(self):
+        result = _execute(self._spec())
+        EvidenceCapsule.pack(result, self.capsule_path)
+        files = self._read_zip(self.capsule_path)
+        path = os.path.join(self.tmp_dir.name, "dup.evidence.zip")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("raw_queries.json", b"[]")
+            for name, data in files.items():
+                zf.writestr(name, data)
+        with self.assertRaises(ValueError):
+            EvidenceCapsule.unpack(path)
+
+    def test_relabeled_capsule_passes_checksums_but_fails_replay(self):
+        def edit(files, manifest):
+            summary = files["summary.md"].decode("utf-8")
+            summary = "\n".join(l for l in summary.splitlines() if not l.startswith("> "))
+            summary = summary.replace("(not loaded)", "").encode("utf-8")
+            files["summary.md"] = summary
+            manifest["manifest_files"]["summary.md"] = {"sha256": compute_sha256(summary), "bytes": len(summary)}
+            manifest["notice"] = ""
+        path = self._rewrite(edit)
+        EvidenceCapsule.unpack(path)  # checksums still match
+        verdict = ReplayEngine.replay(path)
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertFalse(verdict.summary_verified)
+        self.assertIn("simulated-retrieval notice", verdict.details)
+
+    def test_inflated_summary_headline_fails_replay(self):
+        def edit(files, manifest):
+            summary = files["summary.md"].decode("utf-8")
+            stored = manifest["metrics"]["NDCG@10"]
+            summary = summary.replace(f"**NDCG@10:** {stored}", "**NDCG@10:** 0.9912").encode("utf-8")
+            files["summary.md"] = summary
+            manifest["manifest_files"]["summary.md"] = {"sha256": compute_sha256(summary), "bytes": len(summary)}
+        verdict = ReplayEngine.replay(self._rewrite(edit))
+        self.assertEqual(verdict.status, ReplayStatus.DRIFT_DETECTED)
+        self.assertIn("summary.md NDCG@10 0.9912", verdict.details)
+
+    def test_capsule_claiming_another_backend_is_not_replayable(self):
+        def edit(files, manifest):
+            manifest["retrieval_backend"] = "olmo3-7b-dense"
+        verdict = ReplayEngine.replay(self._rewrite(edit))
+        self.assertEqual(verdict.status, ReplayStatus.NOT_REPLAYABLE)
+        self.assertFalse(verdict.is_passing())
+
+    def test_authorized_remote_dispatch_capsule_replays(self):
+        spec = self._spec(execution_policy=ExecutionPolicy(mode="REMOTE_DISPATCH", require_authorization_grant=True))
+        digest = spec.canonical_digest()
+        spec.execution_policy.grant = AuthorizationGrant(
+            grant_id="GRANT-TEST", operator="op", target_payload_sha256=digest, max_query_budget=100,
+            expires_at_iso="2099-01-01T00:00:00Z", signature=compute_sha256(f"op:{digest}:100"),
+        )
+        EvidenceCapsule.pack(_execute(spec), self.capsule_path)
+        self.assertEqual(ReplayEngine.replay(self.capsule_path).status, ReplayStatus.EXACT_MATCH)
+
+    def test_unpack_rejects_incomplete_or_padded_capsules(self):
+        def drop_digest(files, manifest):
+            del manifest["chain_digest"]
+
+        def drop_summary_checksum(files, manifest):
+            del manifest["manifest_files"]["summary.md"]
+
+        def add_file(files, manifest):
+            files["extra.txt"] = b"unlisted"
+
+        def records_not_a_list(files, manifest):
+            files["raw_queries.json"] = b"5"
+            manifest["manifest_files"]["raw_queries.json"] = {"sha256": compute_sha256(b"5"), "bytes": 1}
+
+        for edit in (drop_digest, drop_summary_checksum, add_file, records_not_a_list):
+            with self.assertRaises(ValueError, msg=edit.__name__):
+                EvidenceCapsule.unpack(self._rewrite(edit, f"{edit.__name__}.evidence.zip"))
+
+    def test_metrics_at_10_ignore_ranks_beyond_10(self):
+        result = _execute(self._spec(top_k=20, query_count=10, random_seed=7))
+        for q in result.evaluated_queries:
+            self.assertEqual(len(q.relevance_scores), 20)
+            self.assertEqual(sum(q.relevance_scores[10:]), 0.0, q.query_id)
+            if q.ndcg_at_10 == 0.0:
+                self.assertEqual(sum(q.relevance_scores), 0.0, q.query_id)
+
     def test_v1_0_0_capsule_with_merkle_root_key_still_replays(self):
-        result = EvidenceWorkbenchEngine().execute(self._spec())
+        result = _execute(self._spec())
         EvidenceCapsule.pack(result, self.capsule_path)
         files = self._read_zip(self.capsule_path)
         manifest = json.loads(files["manifest.json"])
