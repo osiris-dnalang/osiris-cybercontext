@@ -10,10 +10,12 @@ checks in order:
    mention of a ``.env`` file.
 2. If the whole turn parses as Python, an AST walk that flags calls to the
    builtins ``exec``, ``eval``, ``compile`` and ``__import__`` (called by bare
-   name or as ``builtins.<name>``), and the dotted calls in FORBIDDEN_MODULES
-   (``os.system``, ``subprocess.run`` and so on). Methods that share a name,
-   such as ``model.eval()`` or ``re.compile()``, are not flagged. A turn that
-   does not parse as Python skips this check.
+   name or as ``builtins.<name>``), the dotted calls in FORBIDDEN_MODULES
+   (``os.system``, ``subprocess.run`` and so on), and any call with a keyword
+   argument ``shell=True`` (so an aliased ``import subprocess as s;
+   s.run(cmd, shell=True)`` is caught even though the dotted name differs).
+   Methods that share a name, such as ``model.eval()`` or ``re.compile()``,
+   are not flagged. A turn that does not parse as Python skips this check.
 
 Obfuscated payloads get through: string-built names
 (``getattr(__builtins__, "ev" + "al")``), aliased imports
@@ -120,4 +122,17 @@ class CyberContextASTFirewall:
                     ast_nodes_count=node_count,
                     detection_layer="ast",
                 )
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "shell"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                ):
+                    return SanitizedTurn(
+                        raw_content=content,
+                        is_safe=False,
+                        quarantine_reason=f"Forbidden shell=True keyword in call to '{dotted or '<unnamed>'}()'",
+                        ast_nodes_count=node_count,
+                        detection_layer="ast",
+                    )
         return SanitizedTurn(raw_content=content, is_safe=True, ast_nodes_count=node_count)

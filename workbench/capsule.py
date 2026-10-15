@@ -17,6 +17,7 @@ from typing import Any, Dict
 
 from core.ledger import compute_sha256
 from .engine import ExecutionResult, RETRIEVAL_BACKEND, SIMULATION_NOTICE
+from .real_scifact import REAL_BACKEND, REAL_NOTICE
 from .schema import canonical_json_bytes, ExperimentSpec
 
 
@@ -72,7 +73,11 @@ class EvidenceCapsule:
 
         # 2. Prepare summary.md
         simulated = result.retrieval_backend == RETRIEVAL_BACKEND
-        notice = SIMULATION_NOTICE if simulated else ""
+        notice = (
+            SIMULATION_NOTICE
+            if simulated
+            else (REAL_NOTICE if result.retrieval_backend == REAL_BACKEND else "")
+        )
         summary_md = (
             f"# DNA-Lang Evidence Capsule: {result.spec.experiment_id}\n\n"
             + (f"> {notice}\n\n" if notice else "")

@@ -10,16 +10,20 @@ For the simulated reference engine this is a determinism check (same seed and
 same code give the same output). It is not an independent reproduction of a
 model evaluation. The capsule does not pin a code version, so a change to the
 engine code also shows up as drift. A capsule that says it came from a backend
-other than the simulated engine cannot be re-run here and is reported as
-NOT_REPLAYABLE.
+other than the simulated engine or the optional BM25 backend
+(``bm25-stdlib-scifact``) cannot be re-run here and is reported as
+NOT_REPLAYABLE. A BM25 capsule can be re-run when ``real_data_dir`` points at
+the same BEIR SciFact directory the run used; that re-run is deterministic for
+the same corpus and the same code.
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from core.ledger import EvidenceLedger
 from .capsule import EvidenceCapsule
 from .engine import (
     EvidenceWorkbenchEngine,
@@ -27,6 +31,7 @@ from .engine import (
     QuotaExceededViolation,
     RETRIEVAL_BACKEND,
 )
+from .real_scifact import REAL_BACKEND, run_real_scifact
 from .schema import AuthorizationGrant, ExperimentSpec, ExecutionPolicy
 
 
@@ -110,6 +115,9 @@ def _summary_problems(summary_md: str, expected: Dict[str, Any], tolerance: floa
     if not legacy and expected.get("retrieval_backend") == RETRIEVAL_BACKEND:
         if not any(line.startswith("> Simulated retrieval") for line in summary_md.splitlines()):
             problems.append("summary.md is missing the simulated-retrieval notice")
+    if not legacy and expected.get("retrieval_backend") == REAL_BACKEND:
+        if not any(line.startswith("> Real retrieval") for line in summary_md.splitlines()):
+            problems.append("summary.md is missing the real-retrieval notice")
     return problems
 
 
@@ -117,8 +125,13 @@ class ReplayEngine:
     """Checks a capsule's file checksums, re-runs its spec and compares the results."""
 
     @classmethod
-    def replay(cls, capsule_path: str, tolerance: float = 1e-4) -> ReplayVerdict:
-        """Checks file checksums, re-runs the stored spec in a fresh engine, and diffs the results."""
+    def replay(cls, capsule_path: str, tolerance: float = 1e-4, real_data_dir: Optional[str] = None) -> ReplayVerdict:
+        """Checks file checksums, re-runs the stored spec in a fresh engine, and diffs the results.
+
+        ``real_data_dir`` is the BEIR SciFact directory used to re-run capsules
+        whose retrieval backend is ``bm25-stdlib-scifact``; without it such
+        capsules are NOT_REPLAYABLE.
+        """
 
         def verdict(status, details, experiment_id="UNKNOWN", stored=None, **kw):
             return ReplayVerdict(
@@ -144,11 +157,19 @@ class ReplayEngine:
         if backend is None and not legacy:
             return verdict(ReplayStatus.TAMPER_DETECTED, "Manifest has no retrieval_backend label.",
                            experiment_id, stored_metrics)
-        if backend is not None and backend != RETRIEVAL_BACKEND:
+        if backend is not None and backend not in (RETRIEVAL_BACKEND, REAL_BACKEND):
             return verdict(
                 ReplayStatus.NOT_REPLAYABLE,
                 f"Capsule says its retrieval backend is '{backend}'; the installed engine can only "
-                f"re-run '{RETRIEVAL_BACKEND}' capsules.",
+                f"re-run '{RETRIEVAL_BACKEND}' capsules and '{REAL_BACKEND}' capsules "
+                "(the latter needs the SciFact directory, pass --data).",
+                experiment_id, stored_metrics,
+            )
+        if backend == REAL_BACKEND and real_data_dir is None:
+            return verdict(
+                ReplayStatus.NOT_REPLAYABLE,
+                f"Capsule was produced by the '{REAL_BACKEND}' backend; a re-run needs the BEIR "
+                "SciFact directory it was built from (pass --data <directory>).",
                 experiment_id, stored_metrics,
             )
 
@@ -169,20 +190,35 @@ class ReplayEngine:
             )
 
         # 2. Re-execute experiment in a fresh engine
-        engine = EvidenceWorkbenchEngine()
-        try:
-            replay_result = engine.execute(spec)
-        except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
-            return verdict(ReplayStatus.NOT_REPLAYABLE, f"The policy gate refused the re-run: {e}",
-                           experiment_id, stored_metrics)
-        except (TypeError, ValueError) as e:
-            return verdict(ReplayStatus.TAMPER_DETECTED, f"Manifest spec is malformed: {e!r}",
-                           experiment_id, stored_metrics)
-        finally:
-            engine.ledger.close()
+        if backend == REAL_BACKEND:
+            real_ledger = EvidenceLedger(":memory:")
+            try:
+                replay_result = run_real_scifact(spec, real_data_dir, ledger=real_ledger)
+            except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
+                return verdict(ReplayStatus.NOT_REPLAYABLE, f"The policy gate refused the re-run: {e}",
+                               experiment_id, stored_metrics)
+            except (OSError, ValueError) as e:
+                return verdict(ReplayStatus.NOT_REPLAYABLE,
+                               f"The '{REAL_BACKEND}' backend could not re-run (dataset problem?): {e}",
+                               experiment_id, stored_metrics)
+            finally:
+                real_ledger.close()
+        else:
+            engine = EvidenceWorkbenchEngine()
+            try:
+                replay_result = engine.execute(spec)
+            except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
+                return verdict(ReplayStatus.NOT_REPLAYABLE, f"The policy gate refused the re-run: {e}",
+                               experiment_id, stored_metrics)
+            except (TypeError, ValueError) as e:
+                return verdict(ReplayStatus.TAMPER_DETECTED, f"Manifest spec is malformed: {e!r}",
+                               experiment_id, stored_metrics)
+            finally:
+                engine.ledger.close()
         replay_metrics = replay_result.metrics
-        # The simulated engine is deterministic, so any difference at all is drift.
-        if replay_result.retrieval_backend == RETRIEVAL_BACKEND:
+        # The simulated engine and the BM25 backend are both deterministic for the
+        # same inputs and code, so any difference at all is drift.
+        if replay_result.retrieval_backend in (RETRIEVAL_BACKEND, REAL_BACKEND):
             tolerance = 0.0
 
         # 3. Compare per-query records, chain digest, counts, labels and summary
@@ -214,8 +250,12 @@ class ReplayEngine:
             summary_problems.append(
                 f"manifest ledger_blocks_count {manifest.get('ledger_blocks_count')} != replay {replay_result.ledger_blocks_count}"
             )
-        if not legacy and not str(manifest.get("notice", "")).startswith("Simulated retrieval"):
-            summary_problems.append("manifest is missing the simulated-retrieval notice")
+        notice = str(manifest.get("notice", ""))
+        if not legacy:
+            if backend == RETRIEVAL_BACKEND and not notice.startswith("Simulated retrieval"):
+                summary_problems.append("manifest is missing the simulated-retrieval notice")
+            if backend == REAL_BACKEND and not notice.startswith("Real retrieval"):
+                summary_problems.append("manifest is missing the real-retrieval notice")
         summary_problems += _summary_problems(
             capsule_data["summary_md"],
             {
