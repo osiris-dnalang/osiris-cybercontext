@@ -55,12 +55,14 @@ def _build_spec(
     ceiling: int = 100,
     mode: str = "LOCAL_BOUNDED",
     experiment_id: str | None = None,
+    dataset: str = "SciFact",
 ) -> ExperimentSpec:
+    exp_id = experiment_id or f"EXP-OLMO3-BEIR-{dataset.upper()}-001"
     return ExperimentSpec(
-        experiment_id=experiment_id or "EXP-OLMO3-BEIR-SCIFACT-001",
+        experiment_id=exp_id,
         model_id="allenai/Olmo-3-7B-Instruct",
         benchmark_suite="MTEB/BEIR",
-        dataset="SciFact",
+        dataset=dataset,
         split="test",
         query_count=queries,
         top_k=10,
@@ -124,7 +126,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("=" * 70)
     print(f"[!] {SIMULATION_NOTICE}")
 
-    spec = _build_spec(args.queries, args.seed, args.ceiling, args.mode, args.experiment_id)
+    dataset_name = getattr(args, "dataset", "SciFact") or "SciFact"
+    spec = _build_spec(args.queries, args.seed, args.ceiling, args.mode, args.experiment_id, dataset=dataset_name)
 
     print(f"[*] Experiment ID:         {spec.experiment_id}")
     print(f"[*] Model Label:           {spec.model_id} (not loaded)")
@@ -440,6 +443,7 @@ def main() -> int:
 
     # run
     p_run = subparsers.add_parser("run", help="Run the simulated benchmark and create an evidence capsule")
+    p_run.add_argument("--dataset", type=str, default="SciFact", choices=["SciFact", "NFCorpus", "CQADupStack"], help="Target BEIR benchmark dataset")
     p_run.add_argument("--queries", type=_positive_int, default=5, help="Number of queries to evaluate (at least 1)")
     p_run.add_argument("--seed", type=int, default=42, help="Deterministic random seed")
     p_run.add_argument("--ceiling", type=int, default=100, help="Maximum query ceiling")
