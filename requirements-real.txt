@@ -1,0 +1,9 @@
+# Optional extras for model-based real runs:
+#   python -m workbench.cli run-real --backend dense ...                  (sentence-transformers)
+#   python -m workbench.cli run-real --backend dense --rerank-model ...   (transformers, e.g. Olmo 3)
+# The demo, the simulated workbench, download-beir and run-real --backend bm25 need none of these.
+# Tested with sentence-transformers 6.1.0, transformers 5.19.0, torch 2.14.1, numpy 2.5.4 (Python 3.13).
+sentence-transformers>=3.0
+transformers>=4.57.0  # Olmo 3 needs 4.57.0 or later
+torch
+numpy

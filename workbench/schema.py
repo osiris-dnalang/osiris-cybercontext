@@ -74,7 +74,11 @@ class ExperimentSpec:
     """Canonical specification for a dense-retrieval benchmark run.
 
     ``model_id`` and ``dataset`` are labels recorded in the spec. The reference
-    engine loads neither (see workbench/engine.py).
+    engine loads neither (see workbench/engine.py). Real runs
+    (workbench/real_scifact.py) use ``model_id`` as the embedding model and
+    read the backend, model revision, query prefix and reranker from
+    ``retrieval_options``; it joins the canonical digest only when non-empty,
+    so specs without it keep their existing digests.
     """
     experiment_id: str
     model_id: str
@@ -87,6 +91,7 @@ class ExperimentSpec:
     random_seed: int = 42
     target_metrics: List[str] = field(default_factory=lambda: ["NDCG@10", "MRR@10", "CTC"])
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    retrieval_options: Dict[str, Any] = field(default_factory=dict)
     created_at_iso: str = field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
     )
@@ -113,4 +118,6 @@ class ExperimentSpec:
             "policy_mode": d["execution_policy"]["mode"],
             "max_query_ceiling": d["execution_policy"]["max_query_ceiling"],
         }
+        if d["retrieval_options"]:
+            identity_subset["retrieval_options"] = d["retrieval_options"]
         return compute_sha256(canonical_json_bytes(identity_subset))
