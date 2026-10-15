@@ -1,9 +1,15 @@
-"""Tamper-Evident Evidence Ledger (SQLite + SHA-256 Hash Chain).
+"""Tamper-evident evidence ledger (SQLite + SHA-256 hash chain).
 
-Provides zero-dependency append-only cryptographic logging for:
-- Olmo 3 MTEB/BEIR benchmark metrics
-- CyberContext compacted session state
-- Tandemonium hardware event contracts
+Zero-dependency append-only log used by the demo and the evidence workbench.
+
+What verify_integrity() detects: a block edited in place without recomputing
+its hash and every later hash (for example a direct SQL UPDATE of one row), and
+gaps or re-ordering in the sequence.
+
+What it does not detect: anyone with write access to the database can rewrite a
+block and recompute the rest of the chain, and the result verifies as intact.
+There is no signature and no external anchor, so a passing check means "this
+file is internally consistent", not "this history is authentic".
 """
 
 from __future__ import annotations
@@ -17,7 +23,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def canonical_json(data: Any) -> str:
-    """Serialize into RFC 8785 deterministic JSON."""
+    """Serialize to deterministic JSON: sorted keys, compact separators.
+
+    Modeled on RFC 8785 (JCS) but not a full implementation: number formatting
+    and the ordering of some non-ASCII keys can differ, and values JSON can't
+    represent are stringified via ``default=str``.
+    """
     return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
 
 
@@ -136,7 +147,12 @@ class EvidenceLedger:
 
         return True, f"All {len(rows)} blocks verified successfully. Hash chain is intact."
 
-    def get_merkle_root(self) -> str:
+    def chain_digest(self) -> str:
+        """SHA-256 over the ordered block hashes joined with ':'.
+
+        One digest that summarizes the whole chain. It is not a Merkle tree
+        root: there is no tree and no inclusion proof.
+        """
         cursor = self.conn.cursor()
         cursor.execute("SELECT current_hash FROM ledger ORDER BY entry_id ASC")
         hashes = [r[0] for r in cursor.fetchall()]
@@ -146,9 +162,13 @@ class EvidenceLedger:
         combined = ":".join(hashes)
         return compute_sha256(combined)
 
+    def get_merkle_root(self) -> str:
+        """Deprecated alias for chain_digest(); the value is not a Merkle root."""
+        return self.chain_digest()
+
     def merkle_root(self) -> str:
-        """Alias for get_merkle_root."""
-        return self.get_merkle_root()
+        """Deprecated alias for chain_digest(); the value is not a Merkle root."""
+        return self.chain_digest()
 
     def fetch_chain(self) -> List[Dict[str, Any]]:
         """Fetch all ledger blocks as dictionaries."""

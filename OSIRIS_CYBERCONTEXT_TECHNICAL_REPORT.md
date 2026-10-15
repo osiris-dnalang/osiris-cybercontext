@@ -1,5 +1,7 @@
 # OSIRIS × CyberContext: Governed Dual-Substrate Execution, Deterministic AST Provenance Firewalls, and Tamper-Evident Benchmarking for Autonomous Multi-Agent Systems
 
+> **Errata (added after deposit):** this file is the v0.1.0 text as deposited on Zenodo. Several statements don't match the code; see [ERRATA.md](ERRATA.md).
+
 **Author:** Devin Phillip Davis  
 **Affiliation:** Agile Defense Systems LLC (CAGE: 9HUP5)  
 **System Telemetry:** OSIRIS Autonomous Research Runtime (DNA::}{::Lang Ecosystem)  

@@ -1,7 +1,15 @@
-"""Evidence Workbench Execution Engine.
+"""Evidence Workbench execution engine (reference implementation, simulated retrieval).
 
-Executes dense retrieval benchmarks under strict governance invariants,
-recording full execution telemetry into append-only cryptographic evidence chains.
+The engine enforces the policy gates (query ceiling, and an authorization grant
+for REMOTE_DISPATCH) and records each query in a hash-chained ledger.
+
+The retrieval itself is simulated. No model or dataset is loaded. Query texts
+come from a fixed list of ten SciFact-style placeholder claims (cycled when more
+than ten queries are requested); they are not read from the BEIR SciFact
+dataset. Retrieved document IDs come from a seeded random generator, and one
+"relevant" document is planted at a random rank. The resulting NDCG@10 and
+MRR@10 values exercise the evidence pipeline. They say nothing about any
+model's retrieval quality.
 """
 
 from __future__ import annotations
@@ -21,6 +29,13 @@ from .schema import (
     ExecutionPolicy,
     AuthorizationGrant,
     canonical_json_bytes,
+)
+
+RETRIEVAL_BACKEND = "simulated-seeded-rng"
+SIMULATION_NOTICE = (
+    "Simulated retrieval: no model or dataset is loaded. Document IDs come from a "
+    "seeded RNG and the relevant document is planted, so the metrics test the "
+    "evidence pipeline, not a model."
 )
 
 
@@ -51,14 +66,15 @@ class ExecutionResult:
     spec_digest: str
     evaluated_queries: List[QueryRecord]
     metrics: Dict[str, float]
-    merkle_root: str
+    chain_digest: str
     ledger_blocks_count: int
     environment_telemetry: Dict[str, Any]
     elapsed_seconds: float
+    retrieval_backend: str = RETRIEVAL_BACKEND
 
 
 class EvidenceWorkbenchEngine:
-    """Executes benchmark specifications within verifiable policy bounds."""
+    """Runs a (simulated) benchmark spec behind the policy gates and records it in a ledger."""
 
     def __init__(self, ledger: EvidenceLedger | None = None):
         self.ledger = ledger or EvidenceLedger(":memory:")
@@ -95,7 +111,7 @@ class EvidenceWorkbenchEngine:
             "pid": os.getpid(),
         }
 
-        # Deterministic Evaluation Corpus (SciFact benchmark simulation)
+        # Simulated corpus: placeholder claims, seeded pseudo-retrieval (see module docstring)
         rng = random.Random(spec.random_seed)
         query_records: List[QueryRecord] = []
         ndcg_list: List[float] = []
@@ -125,21 +141,16 @@ class EvidenceWorkbenchEngine:
             if rel_rank <= spec.top_k:
                 retrieved_docs[rel_rank - 1] = relevant_doc
 
-            # Compute NDCG@10 and MRR@10
-            rel_set = {relevant_doc}
-            binary_rel = [1 if d in rel_set else 0 for d in retrieved_docs[:spec.top_k]]
-
-            # DCG & IDCG
-            dcg = sum((2**r - 1) / math.log2(idx + 1) for idx, r in enumerate(binary_rel, start=1))
-            idcg = 1.0 / math.log2(2)  # 1 relevant item at rank 1
-            ndcg = round(dcg / idcg, 4) if idcg > 0 else 0.0
-
-            # MRR
-            mrr = 0.0
-            for idx, d in enumerate(retrieved_docs[:spec.top_k], start=1):
-                if d in rel_set:
-                    mrr = round(1.0 / idx, 4)
-                    break
+            # Compute NDCG@10 and MRR@10. The relevant document counts once, at its
+            # first rank: a random filler ID can collide with it, and counting
+            # both copies pushed NDCG above 1.
+            hit_rank = next(
+                (idx for idx, d in enumerate(retrieved_docs[:spec.top_k], start=1) if d == relevant_doc),
+                None,
+            )
+            dcg = 1.0 / math.log2(hit_rank + 1) if hit_rank else 0.0
+            ndcg = round(dcg, 4)  # IDCG = 1: one relevant document, ideally at rank 1
+            mrr = round(1.0 / hit_rank, 4) if hit_rank else 0.0
 
             ndcg_list.append(ndcg)
             mrr_list.append(mrr)
@@ -150,7 +161,7 @@ class EvidenceWorkbenchEngine:
                     query_id=qid,
                     query_text=claim_text,
                     retrieved_doc_ids=retrieved_docs,
-                    relevance_scores=[1.0 if d in rel_set else 0.0 for d in retrieved_docs],
+                    relevance_scores=[1.0 if idx == hit_rank else 0.0 for idx in range(1, len(retrieved_docs) + 1)],
                     ndcg_at_10=ndcg,
                     mrr_at_10=mrr,
                     query_digest=q_digest,
@@ -168,6 +179,7 @@ class EvidenceWorkbenchEngine:
 
         mean_ndcg = round(sum(ndcg_list) / len(ndcg_list), 4) if ndcg_list else 0.0
         mean_mrr = round(sum(mrr_list) / len(mrr_list), 4) if mrr_list else 0.0
+        # Corpus Task Complexity: a derived convenience score, not a standard IR metric
         ctc = round(1.0 - (mean_ndcg * 0.8 + mean_mrr * 0.2), 4)
 
         metrics = {
@@ -192,14 +204,14 @@ class EvidenceWorkbenchEngine:
 
         elapsed = time.perf_counter() - start_time
         chain_blocks = self.ledger.fetch_chain()
-        merkle_root = self.ledger.merkle_root()
+        chain_digest = self.ledger.chain_digest()
 
         return ExecutionResult(
             spec=spec,
             spec_digest=spec_digest,
             evaluated_queries=query_records,
             metrics=metrics,
-            merkle_root=merkle_root,
+            chain_digest=chain_digest,
             ledger_blocks_count=len(chain_blocks),
             environment_telemetry=env_telemetry,
             elapsed_seconds=round(elapsed, 4),
