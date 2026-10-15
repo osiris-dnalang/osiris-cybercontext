@@ -191,12 +191,12 @@ def cmd_attack_demo(args: argparse.Namespace) -> int:
         else:
             print(f"[*] Original capsule: {orig_path}")
 
-        with zipfile.ZipFile(orig_path, "r") as zf:
-            files = {name: zf.read(name) for name in zf.namelist()}
         try:
+            with zipfile.ZipFile(orig_path, "r") as zf:
+                files = {name: zf.read(name) for name in zf.namelist()}
             manifest = json.loads(files["manifest.json"])
             records = json.loads(files["raw_queries.json"])
-        except (KeyError, ValueError) as e:
+        except (zipfile.BadZipFile, KeyError, ValueError) as e:
             print(f"[-] Not a readable evidence capsule: {e}")
             return 1
         if not records:
