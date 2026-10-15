@@ -2,14 +2,18 @@
 
 Usage:
     python -m workbench.cli run [--queries N] [--out PATH]
-    python -m workbench.cli run-real --data DIR [--queries N] [--out PATH]
-    python -m workbench.cli replay <capsule_path> [--data DIR]
+    python -m workbench.cli download-beir scifact --dest DIR
+    python -m workbench.cli run-real --data DIR [--backend bm25|dense] [--queries N] [--out PATH]
+    python -m workbench.cli replay <capsule_path> [--data DIR] [--tolerance X]
     python -m workbench.cli verify <capsule_path>
     python -m workbench.cli attack-demo [capsule_path]
 
 The default benchmark run is simulated (see workbench/engine.py): no model or
-dataset is loaded. ``run-real`` is the optional real backend: BM25 over a local
-BEIR SciFact directory (nothing is downloaded; see workbench/real_scifact.py).
+dataset is loaded. ``run-real`` is the optional real backend over a local BEIR
+directory: BM25 (standard library), or an embedding model with an optional
+experimental LLM reranker (see workbench/real_scifact.py and
+workbench/real_models.py). ``download-beir`` fetches that directory from the
+Hugging Face Hub.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from .engine import (
     QuotaExceededViolation,
     SIMULATION_NOTICE,
 )
-from .real_scifact import REAL_BACKEND, REAL_NOTICE, load_beir_dataset, run_real_scifact
+from .real_scifact import NOTICES, backend_label, build_components, load_beir_dataset, run_real_scifact
 from .replay import ReplayEngine
 from .schema import ExperimentSpec, ExecutionPolicy, canonical_json_bytes, compute_sha256
 
@@ -71,20 +75,38 @@ def _build_spec(
     )
 
 
+def _real_options(args: argparse.Namespace | None) -> dict:
+    """retrieval_options for a run-real invocation; empty for BM25, so BM25 specs keep their digest."""
+    if args is None or getattr(args, "backend", "bm25") == "bm25":
+        return {}
+    options = {"backend": "dense"}
+    for key, value in (("model_revision", args.model_revision), ("query_prefix", args.query_prefix),
+                       ("rerank_model", args.rerank_model), ("rerank_revision", args.rerank_revision)):
+        if value:
+            options[key] = value
+    if args.rerank_model:
+        options["rerank_top_n"] = args.rerank_top_n
+    return options
+
+
 def _build_real_spec(
     queries: int,
     ceiling: int = 1000,
     experiment_id: str | None = None,
+    args: argparse.Namespace | None = None,
 ) -> ExperimentSpec:
+    options = _real_options(args)
+    dense = bool(options)
     return ExperimentSpec(
-        experiment_id=experiment_id or "EXP-OLMO3-BEIR-SCIFACT-REAL-001",
-        model_id="bm25-stdlib",
+        experiment_id=experiment_id or ("EXP-BEIR-SCIFACT-DENSE-001" if dense else "EXP-OLMO3-BEIR-SCIFACT-REAL-001"),
+        model_id=args.model if dense else "bm25-stdlib",
         benchmark_suite="MTEB/BEIR",
         dataset="SciFact",
         split="test",
         query_count=queries,
         top_k=10,
-        similarity_metric="bm25",
+        similarity_metric="cosine" if dense else "bm25",
+        retrieval_options=options,
         random_seed=42,
         execution_policy=ExecutionPolicy(
             mode="LOCAL_BOUNDED",
@@ -137,10 +159,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_run_real(args: argparse.Namespace) -> int:
     """Run real BM25 retrieval over a local BEIR SciFact directory and package a capsule."""
+    from .real_models import MissingDependency
+
     print("=" * 70)
-    print("  DNA-LANG EVIDENCE WORKBENCH: REAL RETRIEVAL (BM25) BENCHMARK RUNNER")
+    print("  DNA-LANG EVIDENCE WORKBENCH: REAL RETRIEVAL BENCHMARK RUNNER")
     print("=" * 70)
-    print(f"[!] {REAL_NOTICE}")
 
     try:
         data = load_beir_dataset(args.data)
@@ -150,10 +173,17 @@ def cmd_run_real(args: argparse.Namespace) -> int:
         return 2
 
     queries = args.queries if args.queries is not None else len(data.queries)
-    spec = _build_real_spec(queries, args.ceiling, args.experiment_id)
+    spec = _build_real_spec(queries, args.ceiling, args.experiment_id, args)
+    label = backend_label(spec)
+    print(f"[!] {NOTICES[label]}")
 
     print(f"[*] Experiment ID:         {spec.experiment_id}")
-    print(f"[*] Retrieval Backend:     {REAL_BACKEND}")
+    print(f"[*] Retrieval Backend:     {label}")
+    if spec.retrieval_options:
+        print(f"[*] Model:                 {spec.model_id}")
+    if spec.retrieval_options.get("rerank_model"):
+        print(f"[*] Reranker:              {spec.retrieval_options['rerank_model']} "
+              f"(experimental, top {spec.retrieval_options['rerank_top_n']})")
     print(f"[*] Corpus Documents:     {len(data.corpus)}")
     print(f"[*] Queries in Split:      {len(data.queries)} judged ({data.queries_in_file} in queries.jsonl; evaluating {queries})")
     print(f"[*] Dataset Directory:     {os.path.abspath(args.data)}")
@@ -162,10 +192,14 @@ def cmd_run_real(args: argparse.Namespace) -> int:
     print("-" * 70)
 
     try:
-        result = run_real_scifact(spec, args.data)
+        components = build_components(spec, device=args.device, batch_size=args.batch_size) if spec.retrieval_options else None
+        result = run_real_scifact(spec, args.data, components=components)
     except (GovernanceAuthorizationViolation, QuotaExceededViolation) as e:
         print(f"\n[FAIL-CLOSED VIOLATION DETECTED]")
         print(f"Reason: {e}")
+        return 1
+    except MissingDependency as e:
+        print(f"[-] {e}")
         return 1
 
     print("\n[+] Real Run Complete:")
@@ -179,9 +213,29 @@ def cmd_run_real(args: argparse.Namespace) -> int:
     out_path = args.out or f"{spec.experiment_id}.evidence.zip"
     capsule_path = EvidenceCapsule.pack(result, out_path)
     print(f"\n[+] Evidence Capsule Bundled:      {capsule_path} ({os.path.getsize(capsule_path)} bytes)")
-    print("[i] These are real BM25 scores over the corpus you supplied, but they have not been")
+    print("[i] These are real scores over the corpus you supplied, but they have not been")
     print("    validated against a published reference; check before quoting them publicly.")
     print("=" * 70)
+    return 0
+
+
+def cmd_download_beir(args: argparse.Namespace) -> int:
+    """Download a BEIR-format dataset (corpus, queries, qrels) from the Hugging Face Hub."""
+    from .beir_download import BeirDownloadError, download_beir, file_digests
+
+    print(f"[*] Downloading {args.name} ({args.split} split) from {args.repo or 'mteb/' + args.name} "
+          f"at revision {args.revision} into {args.dest}")
+    try:
+        fetched = download_beir(args.name, args.dest, split=args.split, revision=args.revision, repo=args.repo)
+        data = load_beir_dataset(args.dest, split=args.split)
+    except (BeirDownloadError, OSError, ValueError) as e:
+        print(f"[-] {e}")
+        return 1
+    print(f"[+] Downloaded: {', '.join(fetched) if fetched else 'nothing (files already present)'}")
+    print(f"[+] {len(data.corpus)} documents; {len(data.queries)} judged {args.split} queries "
+          f"({data.queries_in_file} in queries.jsonl)")
+    for rel, meta in file_digests(args.dest, args.split).items():
+        print(f"    {rel:<22} sha256 {meta['sha256']}  {meta['bytes']} bytes")
     return 0
 
 
@@ -196,7 +250,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print("=" * 70)
         return 2
 
-    verdict = ReplayEngine.replay(args.capsule, real_data_dir=args.data)
+    verdict = ReplayEngine.replay(args.capsule, tolerance=args.tolerance, real_data_dir=args.data)
 
     print(f"[*] Experiment ID:       {verdict.experiment_id}")
     print(f"[*] Replay Status:       [{verdict.status.value}]")
@@ -393,6 +447,14 @@ def main() -> int:
     p_run.add_argument("--experiment-id", type=str, default=None, help="Experiment identifier")
     p_run.add_argument("--out", type=str, default=None, help="Output capsule file path")
 
+    # download-beir
+    p_dl = subparsers.add_parser("download-beir", help="Download a BEIR-format dataset from the Hugging Face Hub")
+    p_dl.add_argument("name", help="Dataset name, e.g. scifact (fetched from mteb/<name>)")
+    p_dl.add_argument("--dest", required=True, help="Directory to download into")
+    p_dl.add_argument("--split", default="test")
+    p_dl.add_argument("--revision", default="main", help="Hub revision; a commit SHA pins the data")
+    p_dl.add_argument("--repo", default=None, help="Dataset repo (default mteb/<name>)")
+
     # run-real
     p_real = subparsers.add_parser(
         "run-real",
@@ -407,12 +469,25 @@ def main() -> int:
         help="Number of queries to evaluate (default: all queries in the split)",
     )
     p_real.add_argument("--ceiling", type=int, default=1000, help="Maximum query ceiling")
+    p_real.add_argument("--backend", choices=["bm25", "dense"], default="bm25",
+                        help="bm25 (standard library) or dense (embedding model; needs requirements-real.txt)")
+    p_real.add_argument("--model", default="BAAI/bge-base-en-v1.5", help="Embedding model for --backend dense")
+    p_real.add_argument("--model-revision", default=None, help="Model revision; a commit SHA pins it")
+    p_real.add_argument("--query-prefix", default="", help="Text prepended to each query before encoding")
+    p_real.add_argument("--rerank-model", default=None,
+                        help="Experimental LLM reranker for --backend dense, e.g. allenai/Olmo-3-7B-Instruct")
+    p_real.add_argument("--rerank-revision", default=None)
+    p_real.add_argument("--rerank-top-n", type=_positive_int, default=20)
+    p_real.add_argument("--device", default=None, help="e.g. cpu or cuda (default: the library's choice)")
+    p_real.add_argument("--batch-size", type=_positive_int, default=32)
     p_real.add_argument("--experiment-id", type=str, default=None, help="Experiment identifier")
     p_real.add_argument("--out", type=str, default=None, help="Output capsule file path")
 
     # replay
     p_rep = subparsers.add_parser("replay", help="Re-run a capsule's spec and compare the results")
     p_rep.add_argument("capsule", type=str, help="Path to .evidence.zip capsule")
+    p_rep.add_argument("--tolerance", type=float, default=1e-4,
+                       help="Metric tolerance for dense and reranked real runs (default 1e-4)")
     p_rep.add_argument(
         "--data", type=str, default=None,
         help="BEIR SciFact directory, needed to replay capsules from the BM25 backend",
@@ -434,7 +509,11 @@ def main() -> int:
     if args.command == "run":
         return cmd_run(args)
     elif args.command == "run-real":
+        if args.rerank_model and args.backend != "dense":
+            parser.error("--rerank-model needs --backend dense")
         return cmd_run_real(args)
+    elif args.command == "download-beir":
+        return cmd_download_beir(args)
     elif args.command == "replay":
         return cmd_replay(args)
     elif args.command == "verify":

@@ -1,10 +1,20 @@
-"""Real SciFact retrieval backend (optional extra): BM25 over the local BEIR SciFact corpus.
+"""Real SciFact retrieval backends (optional extra): BM25, dense embeddings, LLM reranking.
 
-This module adds a real retrieval run to the evidence workbench: an Okapi BM25
-index (Python standard library only) built over a local copy of the BEIR
-SciFact corpus, ranked per query, scored with graded NDCG@10 / MRR@10 against
-the dataset's qrels, and recorded in the same hash-chained ledger and capsule
-format as the simulated engine.
+This module adds real retrieval runs to the evidence workbench over a local
+copy of a BEIR dataset (SciFact by default), scored with graded NDCG@10 /
+MRR@10 against the dataset's qrels and recorded in the same hash-chained
+ledger and capsule format as the simulated engine. The backend comes from
+``spec.retrieval_options["backend"]``:
+
+- ``bm25`` (default, standard library only): an Okapi BM25 index.
+- ``dense``: a sentence-transformers embedding model named by ``spec.model_id``
+  (optional extras, see requirements-real.txt), optionally followed by an
+  experimental LLM reranker (``retrieval_options["rerank_model"]``, for
+  example allenai/Olmo-3-7B-Instruct). See workbench/real_models.py.
+
+BM25 is deterministic for the same corpus and code. Dense and reranked runs
+can differ slightly across hardware and library versions, so replay compares
+them within a tolerance.
 
 What is real here: the corpus, queries and relevance judgments are read from
 files on disk; the ranking is BM25 over that corpus; the metrics are computed
@@ -40,6 +50,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.ledger import EvidenceLedger, compute_sha256
+from .beir_download import file_digests
 from .engine import (
     ExecutionResult,
     GovernanceAuthorizationViolation,
@@ -48,12 +59,29 @@ from .engine import (
 )
 
 REAL_BACKEND = "bm25-stdlib-scifact"
+DENSE_BACKEND = "dense-sentence-transformers-scifact"
+RERANK_BACKEND = "dense-sentence-transformers+llm-rerank-scifact"
+REAL_BACKENDS = (REAL_BACKEND, DENSE_BACKEND, RERANK_BACKEND)
+DETERMINISTIC_REAL_BACKENDS = (REAL_BACKEND,)
 REAL_NOTICE = (
     "Real retrieval: BM25 (stdlib) over the local BEIR SciFact corpus, scored "
     "against the dataset's qrels. A lexical baseline, not a neural model; its "
     "tokenizer is simpler than Pyserini's, so the BEIR paper's BM25 number is a "
     "sanity neighborhood, not an expected value."
 )
+DENSE_NOTICE = (
+    "Real retrieval: a sentence-transformers embedding model over the local BEIR "
+    "corpus, scored against the dataset's qrels. Compare with the model's published "
+    "MTEB score before relying on it; results can differ slightly across hardware "
+    "and library versions."
+)
+RERANK_NOTICE = (
+    "Real retrieval: a sentence-transformers embedding model over the local BEIR "
+    "corpus, with the top candidates reordered by an experimental LLM prompt (0-10 "
+    "ratings, not a trained reranker), scored against the dataset's qrels. Results "
+    "can differ across hardware and library versions."
+)
+NOTICES = {REAL_BACKEND: REAL_NOTICE, DENSE_BACKEND: DENSE_NOTICE, RERANK_BACKEND: RERANK_NOTICE}
 BM25_K1 = 0.9
 BM25_B = 0.4
 
@@ -213,10 +241,47 @@ def mrr_at_10(retrieved_ids: List[str], qrels_for_query: Dict[str, int], k: int 
     return 0.0
 
 
+def backend_label(spec: Any) -> str:
+    """Retrieval-backend label for a spec's retrieval_options."""
+    options = spec.retrieval_options or {}
+    backend = options.get("backend", "bm25")
+    if backend == "bm25":
+        return REAL_BACKEND
+    if backend == "dense":
+        return RERANK_BACKEND if options.get("rerank_model") else DENSE_BACKEND
+    raise ValueError(f"unknown real retrieval backend {backend!r}")
+
+
+def build_components(spec: Any, device: Optional[str] = None, batch_size: int = 32):
+    """The (retriever, reranker) a dense spec describes; (None, None) for BM25."""
+    from .real_models import DenseRetriever, LLMPointwiseReranker
+
+    options = spec.retrieval_options or {}
+    if backend_label(spec) == REAL_BACKEND:
+        return None, None
+    retriever = DenseRetriever(
+        model_name=spec.model_id,
+        revision=options.get("model_revision"),
+        query_prefix=options.get("query_prefix", ""),
+        device=device,
+        batch_size=batch_size,
+    )
+    reranker = None
+    if options.get("rerank_model"):
+        reranker = LLMPointwiseReranker(
+            model_id=options["rerank_model"],
+            revision=options.get("rerank_revision"),
+            top_n=int(options.get("rerank_top_n", 20)),
+            device=device,
+        )
+    return retriever, reranker
+
+
 def run_real_scifact(
     spec: Any,
     data_dir: str,
     ledger: Optional[EvidenceLedger] = None,
+    components: Optional[Tuple[Any, Any]] = None,
 ) -> ExecutionResult:
     """Runs BM25 over the local SciFact corpus behind the same policy gates as the simulated engine.
 
@@ -224,7 +289,8 @@ def run_real_scifact(
     ``spec.query_count`` caps how many of the split's queries (in sorted query-ID
     order) are evaluated. The ledger structure mirrors the simulated engine: one
     block per query at timestamps 1000.0 + i, then one consolidation block at
-    2000.0.
+    2000.0. ``components`` overrides the (retriever, reranker) built from the
+    spec for dense runs (tests inject stand-ins).
     """
     start_time = time.perf_counter()
 
@@ -247,6 +313,7 @@ def run_real_scifact(
                 f"Remote dispatch rejected: grant does not match payload {spec_digest[:16]}."
             )
 
+    label = backend_label(spec)
     data = load_beir_dataset(data_dir, split=spec.split)
     if not data.queries:
         raise ValueError(f"No queries found in {os.path.join(data_dir, 'queries.jsonl')}")
@@ -254,8 +321,13 @@ def run_real_scifact(
     own_ledger = ledger is None
     ledger = ledger or EvidenceLedger(":memory:")
     try:
-        corpus_tokens = {doc_id: tokenize(text) for doc_id, text in data.corpus.items()}
-        index = BM25Index(corpus_tokens)
+        if label == REAL_BACKEND:
+            corpus_tokens = {doc_id: tokenize(text) for doc_id, text in data.corpus.items()}
+            index = BM25Index(corpus_tokens)
+            retriever = reranker = None
+        else:
+            retriever, reranker = components if components is not None else build_components(spec)
+            retriever.index(data.corpus)
 
         selected = data.queries[: spec.query_count] if spec.query_count < len(data.queries) else data.queries
 
@@ -264,7 +336,14 @@ def run_real_scifact(
         mrr_list: List[float] = []
 
         for i, (query_id, query_text) in enumerate(selected):
-            ranking = index.search(query_text, top_k=spec.top_k)
+            if label == REAL_BACKEND:
+                ranking = index.search(query_text, top_k=spec.top_k)
+            else:
+                depth = max(spec.top_k, reranker.top_n if reranker else 0)
+                ranking = retriever.search(query_text, depth)
+                if reranker is not None:
+                    ranking = reranker.rerank(query_text, ranking, data.corpus)
+                ranking = ranking[: spec.top_k]
             retrieved = [doc_id for doc_id, _score in ranking]
             qrels_for_query = data.qrels.get(query_id, {})
 
@@ -333,14 +412,19 @@ def run_real_scifact(
         "machine": platform.machine(),
         "processor": platform.processor() or "unknown",
         "pid": os.getpid(),
-        "retrieval_backend": REAL_BACKEND,
-        "bm25_k1": BM25_K1,
-        "bm25_b": BM25_B,
+        "retrieval_backend": label,
         "corpus_documents": len(data.corpus),
         "queries_in_split": len(data.queries),
         "queries_in_file": data.queries_in_file,
         "dataset_dir": os.path.abspath(data_dir),
+        "dataset_files": file_digests(data_dir, spec.split),
     }
+    if label == REAL_BACKEND:
+        env_telemetry.update({"bm25_k1": BM25_K1, "bm25_b": BM25_B})
+    else:
+        env_telemetry["retriever"] = retriever.environment()
+        if reranker is not None:
+            env_telemetry["reranker"] = reranker.environment()
 
     return ExecutionResult(
         spec=spec,
@@ -351,5 +435,45 @@ def run_real_scifact(
         ledger_blocks_count=len(chain_blocks),
         environment_telemetry=env_telemetry,
         elapsed_seconds=round(elapsed, 4),
-        retrieval_backend=REAL_BACKEND,
+        retrieval_backend=label,
     )
+
+
+def record_consistency_problems(records: List[Dict[str, Any]], metrics: Dict[str, Any],
+                                data: SciFactData) -> List[str]:
+    """Check stored per-query records against the qrels and the stored means, without re-running retrieval.
+
+    Replay of a non-deterministic backend accepts rankings that differ from the
+    re-run, so it relies on this check to make sure each stored record is
+    internally consistent: its NDCG/MRR, grades and digest follow from its own
+    ranking and the qrels, and the manifest means follow from the records.
+    """
+    problems = []
+    ndcgs, mrrs = [], []
+    for rec in records:
+        qid = str(rec.get("query_id"))
+        if qid not in data.qrels:
+            problems.append(f"record for query {qid} is not a judged query of this split")
+            continue
+        qrels_for_query = data.qrels[qid]
+        retrieved = rec.get("retrieved_doc_ids")
+        if not isinstance(retrieved, list) or not all(isinstance(d, str) for d in retrieved):
+            problems.append(f"query {qid}: malformed retrieved_doc_ids")
+            continue
+        ndcg = round(graded_ndcg_at_10(retrieved, qrels_for_query), 4)
+        mrr = round(mrr_at_10(retrieved, qrels_for_query), 4)
+        if rec.get("ndcg_at_10") != ndcg or rec.get("mrr_at_10") != mrr:
+            problems.append(f"query {qid}: stored NDCG/MRR do not match its stored ranking")
+        if rec.get("relevance_scores") != [float(qrels_for_query.get(d, 0)) for d in retrieved]:
+            problems.append(f"query {qid}: stored relevance grades differ from the qrels")
+        expected_digest = compute_sha256(f"{qid}:{rec.get('query_text')}:{','.join(retrieved)}:{ndcg}:{mrr}")
+        if rec.get("query_digest") != expected_digest:
+            problems.append(f"query {qid}: stored query_digest does not match the record")
+        ndcgs.append(ndcg)
+        mrrs.append(mrr)
+    if ndcgs:
+        if round(sum(ndcgs) / len(ndcgs), 4) != metrics.get("NDCG@10"):
+            problems.append("manifest NDCG@10 is not the mean of the stored records")
+        if round(sum(mrrs) / len(mrrs), 4) != metrics.get("MRR@10"):
+            problems.append("manifest MRR@10 is not the mean of the stored records")
+    return problems

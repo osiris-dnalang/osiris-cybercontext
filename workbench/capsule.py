@@ -17,7 +17,7 @@ from typing import Any, Dict
 
 from core.ledger import compute_sha256
 from .engine import ExecutionResult, RETRIEVAL_BACKEND, SIMULATION_NOTICE
-from .real_scifact import REAL_BACKEND, REAL_NOTICE
+from .real_scifact import NOTICES
 from .schema import canonical_json_bytes, ExperimentSpec
 
 
@@ -39,6 +39,7 @@ _SUMMARY_LABELS = {
     "Model Label (not loaded)": "model_id",
     "Dataset": "dataset",
     "Dataset Label (placeholder queries)": "dataset",
+    "Reranker (experimental)": "rerank_model",
 }
 _SUMMARY_TITLE = re.compile(r"^# DNA-Lang Evidence Capsule: (?P<value>.*?)\s*$")
 _SUMMARY_LINE = re.compile(r"^- \*\*(?P<label>[^*]+?):\*\* `?(?P<value>[^`]*?)`?\s*$")
@@ -73,10 +74,11 @@ class EvidenceCapsule:
 
         # 2. Prepare summary.md
         simulated = result.retrieval_backend == RETRIEVAL_BACKEND
+        rerank_model = (result.spec.retrieval_options or {}).get("rerank_model")
         notice = (
             SIMULATION_NOTICE
             if simulated
-            else (REAL_NOTICE if result.retrieval_backend == REAL_BACKEND else "")
+            else NOTICES.get(result.retrieval_backend, "")
         )
         summary_md = (
             f"# DNA-Lang Evidence Capsule: {result.spec.experiment_id}\n\n"
@@ -84,7 +86,8 @@ class EvidenceCapsule:
             + f"- **Retrieval Backend:** {result.retrieval_backend}\n"
             f"- **Model{' Label (not loaded)' if simulated else ''}:** {result.spec.model_id}\n"
             f"- **Dataset{' Label (placeholder queries)' if simulated else ''}:** {result.spec.dataset} ({result.spec.split})\n"
-            f"- **Canonical Spec Digest:** `{result.spec_digest}`\n"
+            + (f"- **Reranker (experimental):** {rerank_model}\n" if rerank_model else "")
+            + f"- **Canonical Spec Digest:** `{result.spec_digest}`\n"
             f"- **Ledger Chain Digest:** `{result.chain_digest}`\n"
             f"- **Queries Evaluated:** {result.metrics['queries_evaluated']}\n"
             f"- **NDCG@10:** {result.metrics['NDCG@10']}\n"
