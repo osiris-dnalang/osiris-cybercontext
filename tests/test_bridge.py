@@ -109,11 +109,13 @@ class IntegrationBridgeTests(unittest.TestCase):
         self.assertEqual(metrics.mean_ndcg_at_10, 1.0)
 
     def test_ndcg_counts_a_repeated_relevant_doc_once(self):
+        # d1 is relevant and appears at ranks 2 and 3; only rank 2 may count.
         query = RetrievalQuery(query_id="q1", query_text="t", relevant_doc_ids=["d1"])
-        ndcg, _ = Olmo3BenchmarkHarness.evaluate_query(
-            query, [RetrievedResult("d1", 0.9), RetrievedResult("d1", 0.8)]
+        ndcg, mrr = Olmo3BenchmarkHarness.evaluate_query(
+            query, [RetrievedResult("d9", 0.9), RetrievedResult("d1", 0.8), RetrievedResult("d1", 0.7)]
         )
-        self.assertEqual(ndcg, 1.0)
+        self.assertAlmostEqual(ndcg, 1.0 / math.log2(3))
+        self.assertEqual(mrr, 0.5)
 
     def test_firewall_reports_which_layer_caught_a_turn(self):
         mixed = "Refactor the file and exec('import os; os.system(\"cat /etc/passwd; rm -rf /\")')"

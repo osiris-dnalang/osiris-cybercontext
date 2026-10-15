@@ -150,7 +150,7 @@ python -m workbench.cli attack-demo benchmark_capsule.evidence.zip
 | Check | Catches | Doesn't catch |
 |---|---|---|
 | `verify` | Corruption; a listed file edited without updating its checksum; missing, unlisted or duplicate files | Any edit to `manifest.json` itself (metrics, spec, labels: nothing checks it), and a file edited **and** its checksum rewritten (the manifest is unsigned) |
-| `replay` | Per-query records, chain digest, manifest metrics and counts, the simulated-backend label and notice, and the figures in `summary.md` that differ from re-running the spec. Simulated capsules must match exactly. | Someone who changes the spec itself and repackages. A capsule that claims another backend can't be re-run here and is reported `NOT_REPLAYABLE`; for a real model run, replay would mean re-running the model. |
+| `replay` | Per-query records, chain digest, manifest metrics and counts, the experiment ID, the simulated-backend label and notice, and the figures and labels in `summary.md` that differ from re-running the spec. Simulated capsules must match exactly. | Someone who changes the spec itself and repackages. Spec fields outside the canonical digest (`created_at_iso`, `timeout_seconds`, the stored grant) are not compared. A capsule that claims another backend can't be re-run here and is reported `NOT_REPLAYABLE`; for a real model run, replay would mean re-running the model. |
 | Ledger chain check (`verify_integrity`) | Edits to a stored block that leave its hash alone; deleted or reordered blocks before the newest one | Deleting the newest blocks (or all of them); timestamp edits under 1e-4 s; rewriting a block and recomputing every later hash |
 
 ---

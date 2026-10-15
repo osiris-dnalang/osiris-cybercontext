@@ -202,6 +202,10 @@ class ReplayEngine:
             problems.append("the ledger chain digest differs from the stored value")
 
         summary_problems = []
+        if experiment_id != spec.experiment_id:
+            summary_problems.append(
+                f"manifest experiment_id {experiment_id!r} != spec experiment_id {spec.experiment_id!r}"
+            )
         if stored_metrics.get("queries_evaluated") != replay_metrics["queries_evaluated"]:
             summary_problems.append(
                 f"manifest queries_evaluated {stored_metrics.get('queries_evaluated')} != replay {replay_metrics['queries_evaluated']}"
@@ -222,6 +226,9 @@ class ReplayEngine:
                 "spec_digest": replay_spec_digest,
                 "chain_digest": replay_result.chain_digest,
                 "retrieval_backend": replay_result.retrieval_backend,
+                "experiment_id": spec.experiment_id,
+                "model_id": spec.model_id,
+                "dataset": f"{spec.dataset} ({spec.split})",
             },
             tolerance,
             legacy,
