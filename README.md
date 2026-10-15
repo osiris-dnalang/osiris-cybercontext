@@ -157,7 +157,7 @@ python -m workbench.cli attack-demo benchmark_capsule.evidence.zip
 
 ### Real SciFact retrieval (optional extra)
 
-`workbench/real_scifact.py` adds a real retrieval run on top of the same ledger and capsule pipeline: an Okapi BM25 index (Python standard library only) built over a local copy of the BEIR SciFact corpus, ranked per query and scored with graded NDCG@10 / MRR@10 against the dataset's qrels. Nothing is downloaded — you point it at a directory in the BEIR layout (`corpus.jsonl`, `queries.jsonl`, `qrels/test.tsv`):
+`workbench/real_scifact.py` adds a real retrieval run on top of the same ledger and capsule pipeline: an Okapi BM25 index (Python standard library only) built over a local copy of the BEIR SciFact corpus, ranked per query and scored with graded NDCG@10 / MRR@10 against the dataset's qrels. Only the split's judged queries are evaluated (SciFact's `queries.jsonl` also lists its train queries; the test split judges 300), as in BEIR and MTEB. SciFact's qrels are binary, so graded and binary NDCG coincide on it. Nothing is downloaded — you point it at a directory in the BEIR layout (`corpus.jsonl`, `queries.jsonl`, `qrels/test.tsv`):
 
 ```bash
 python -m workbench.cli run-real --data /path/to/beir_scifact --out real_capsule.evidence.zip
