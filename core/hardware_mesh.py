@@ -2,7 +2,8 @@
 
 No device I/O happens in this module. detect_host_substrate() reports what the
 standard library can see about the host: the OS, the CPU architecture and, on
-Linux, SIMD feature flags read from /proc/cpuinfo. dispatch_device_event()
+Linux, whether /proc/cpuinfo lists AVX2, AVX-VNNI, AVX-512F or NEON (no other
+flags are checked). dispatch_device_event()
 range-checks a DeviceEvent and records it in the evidence ledger; it does not
 talk to WebHID, SDL3 or any driver.
 
@@ -34,7 +35,7 @@ class HardwareProfile:
     substrate: SubstrateType
     max_execution_horizon_sec: float  # configured default; not enforced here
     thermal_ceiling_celsius: float    # configured default; temperature is not measured
-    hardware_acceleration: str        # SIMD flags found in /proc/cpuinfo, or "not detected"
+    hardware_acceleration: str        # which of AVX2/AVX-VNNI/AVX-512F/NEON /proc/cpuinfo lists
     system: str = ""
     machine: str = ""
 
@@ -91,8 +92,11 @@ class TandemoniumSubstrateBridge:
         system = platform.system()
         machine = platform.machine()
         arch = machine.lower()
-        features = _read_cpu_features() if system == "Linux" else []
-        acceleration = " / ".join(features) if features else "not detected"
+        if system == "Linux":
+            features = _read_cpu_features()
+            acceleration = " / ".join(features) if features else "none of AVX2/AVX-VNNI/AVX-512F/NEON listed"
+        else:
+            acceleration = "not checked (Linux /proc/cpuinfo only)"
 
         if arch in ("x86_64", "amd64"):
             substrate, horizon, thermal = SubstrateType.WORKSTATION, 1800.0, 85.0

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import zipfile
@@ -32,6 +33,13 @@ from .engine import (
 )
 from .replay import ReplayEngine
 from .schema import ExperimentSpec, ExecutionPolicy, canonical_json_bytes, compute_sha256
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
 
 def _build_spec(
@@ -117,6 +125,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
     print(f"[*] Replay Status:       [{verdict.status.value}]")
     print(f"[*] Records Match:       {verdict.records_verified}")
     print(f"[*] Chain Digest Match:  {verdict.chain_digest_verified}")
+    print(f"[*] Summary Match:       {verdict.summary_verified}")
     print("-" * 70)
 
     print("Metric Comparison Table:")
@@ -147,26 +156,33 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return 2
     try:
         data = EvidenceCapsule.unpack(args.capsule)
-        manifest = data["manifest"]
-        print(f"[+] File Checksums:        [MATCH MANIFEST]")
-        print(f"[*] Experiment ID:         {manifest['experiment_id']}")
-        print(f"[*] Retrieval Backend:     {manifest.get('retrieval_backend', 'not recorded (v1.0.0 capsule)')}")
-        print(f"[*] Canonical Spec Digest: {manifest['spec_digest']}")
-        print(f"[*] Ledger Chain Digest:   {manifest['chain_digest']}")
-        print(f"[*] Metric Summary:        NDCG@10={manifest['metrics']['NDCG@10']} | MRR@10={manifest['metrics']['MRR@10']}")
-        print("[i] The manifest is unsigned: this shows the files match it, not who produced them.")
-        print("=" * 70)
-        return 0
     except Exception as e:
         print(f"[-] File Checksums:        [ALERT: CORRUPTED OR TAMPERED]")
         print(f"[-] Diagnostic:            {e}")
         print("=" * 70)
         return 1
 
+    manifest = data["manifest"]
+    metrics = manifest["metrics"]
+    print(f"[+] File Checksums:        [MATCH MANIFEST]")
+    print(f"[*] Experiment ID:         {manifest['experiment_id']}")
+    print(f"[*] Retrieval Backend:     {manifest.get('retrieval_backend', 'not recorded (v1.0.0 capsule)')}")
+    print(f"[*] Canonical Spec Digest: {manifest['spec_digest']}")
+    print(f"[*] Ledger Chain Digest:   {manifest['chain_digest']}")
+    print(f"[*] Metrics (unchecked):   NDCG@10={metrics.get('NDCG@10', 'N/A')} | MRR@10={metrics.get('MRR@10', 'N/A')}")
+    print("[i] Only the listed files are checksummed. manifest.json itself (metrics, spec, labels)")
+    print("    is unsigned and unchecked; use replay to compare it with a re-run.")
+    print("=" * 70)
+    return 0
+
 
 def _build_demo_capsule(path: str) -> str:
     """Run the default simulated benchmark and pack it at ``path``."""
-    result = EvidenceWorkbenchEngine().execute(_build_spec())
+    engine = EvidenceWorkbenchEngine()
+    try:
+        result = engine.execute(_build_spec())
+    finally:
+        engine.ledger.close()
     return EvidenceCapsule.pack(result, path)
 
 
@@ -177,7 +193,11 @@ def _write_capsule(path: str, files: dict) -> None:
 
 
 def cmd_attack_demo(args: argparse.Namespace) -> int:
-    """Tamper with copies of a capsule two ways and report which check catches each."""
+    """Tamper with copies of a capsule three ways and report which check catches each.
+
+    Exit codes: 0 every attack was caught as described, 1 a detection failed or the
+    starting capsule doesn't pass verify and replay, 2 nothing to tamper with.
+    """
     print("=" * 70)
     print("  DNA-LANG EVIDENCE WORKBENCH: TAMPER-DETECTION DEMO")
     print("=" * 70)
@@ -191,64 +211,93 @@ def cmd_attack_demo(args: argparse.Namespace) -> int:
         else:
             print(f"[*] Original capsule: {orig_path}")
 
-        try:
-            with zipfile.ZipFile(orig_path, "r") as zf:
-                files = {name: zf.read(name) for name in zf.namelist()}
-            manifest = json.loads(files["manifest.json"])
-            records = json.loads(files["raw_queries.json"])
-        except (zipfile.BadZipFile, KeyError, ValueError) as e:
-            print(f"[-] Not a readable evidence capsule: {e}")
+        # The starting capsule must pass both checks, or a "detection" below proves nothing.
+        baseline = ReplayEngine.replay(orig_path)
+        if not baseline.is_passing():
+            print(f"[-] The starting capsule does not pass replay [{baseline.status.value}]: {baseline.details}")
+            print("    Use a clean capsule (or none) so detections can be attributed to the tampering.")
             return 1
+
+        with zipfile.ZipFile(orig_path, "r") as zf:
+            files = {name: zf.read(name) for name in zf.namelist()}
+        manifest = json.loads(files["manifest.json"])
+        records = json.loads(files["raw_queries.json"])
         if not records:
             print("[-] Capsule has no query records to tamper with.")
-            return 1
+            return 2
+
+        def rehash(name: str, data: bytes) -> dict:
+            forged_manifest = json.loads(files["manifest.json"])
+            forged_manifest["manifest_files"][name] = {"sha256": compute_sha256(data), "bytes": len(data)}
+            return forged_manifest
+
+        def passes_verify(path: str) -> bool:
+            try:
+                EvidenceCapsule.unpack(path)
+                return True
+            except ValueError:
+                return False
 
         # The attacker changes query 1's NDCG@10 in the per-query records.
         old_score = records[0]["ndcg_at_10"]
         new_score = 0.0 if old_score == 1.0 else 1.0
         records[0]["ndcg_at_10"] = new_score
         forged_records = canonical_json_bytes(records)
-        print(f"[*] Tampering: query 1 NDCG@10 {old_score} -> {new_score} in raw_queries.json")
+        print(f"[*] Records attack: query 1 NDCG@10 {old_score} -> {new_score} in raw_queries.json")
 
         # Attack 1: edit the file only.
         naive_path = os.path.join(work_dir, "naive.evidence.zip")
         _write_capsule(naive_path, {**files, "raw_queries.json": forged_records})
-        try:
-            EvidenceCapsule.unpack(naive_path)
-            naive_caught, naive_note = False, "checksums still matched"
-        except ValueError as e:
-            naive_caught, naive_note = True, str(e)
+        naive_caught = not passes_verify(naive_path)
 
         # Attack 2: edit the file and rewrite its checksum in the (unsigned) manifest.
-        manifest["manifest_files"]["raw_queries.json"] = {
-            "sha256": compute_sha256(forged_records),
-            "bytes": len(forged_records),
-        }
         forged_path = os.path.join(work_dir, "forged.evidence.zip")
         _write_capsule(forged_path, {
             **files,
-            "manifest.json": canonical_json_bytes(manifest),
+            "manifest.json": canonical_json_bytes(rehash("raw_queries.json", forged_records)),
             "raw_queries.json": forged_records,
         })
-        try:
-            EvidenceCapsule.unpack(forged_path)
-            forged_passes_verify = True
-        except ValueError:
-            forged_passes_verify = False
+        forged_passes_verify = passes_verify(forged_path)
         forged_verdict = ReplayEngine.replay(forged_path)
-        forged_caught = not forged_verdict.is_passing()
+
+        # Attack 3: relabel the run as a real model run and inflate the headline NDCG@10.
+        summary = files["summary.md"].decode("utf-8")
+        relabeled_summary = "\n".join(
+            line for line in summary.splitlines() if not line.startswith("> ")
+        ).replace("(not loaded)", "").replace("(placeholder queries)", "")
+        relabeled_summary = re.sub(r"(\*\*NDCG@10:\*\* )\S+", r"\g<1>0.9912", relabeled_summary).encode("utf-8")
+        relabel_manifest = rehash("summary.md", relabeled_summary)
+        relabel_manifest["notice"] = ""
+        relabel_path = os.path.join(work_dir, "relabel.evidence.zip")
+        _write_capsule(relabel_path, {
+            **files,
+            "manifest.json": canonical_json_bytes(relabel_manifest),
+            "summary.md": relabeled_summary,
+        })
+        relabel_passes_verify = passes_verify(relabel_path)
+        relabel_verdict = ReplayEngine.replay(relabel_path)
+
+    def outcome(caught: bool) -> str:
+        return "DETECTED" if caught else "NOT DETECTED"
 
     print("\n[Attack 1] Edit raw_queries.json, leave the manifest alone")
-    print(f"    verify: {'DETECTED' if naive_caught else 'NOT DETECTED'} ({naive_note})")
+    print(f"    verify: {outcome(naive_caught)}")
     print("\n[Attack 2] Edit raw_queries.json and rewrite its checksum in manifest.json")
-    print(f"    verify: {'PASSES' if forged_passes_verify else 'DETECTED'} (the manifest is unsigned, so a rewritten checksum is accepted)")
-    print(f"    replay: {'DETECTED' if forged_caught else 'NOT DETECTED'} [{forged_verdict.status.value}] {forged_verdict.details}")
+    if forged_passes_verify:
+        print("    verify: PASSES (the manifest is unsigned, so a rewritten checksum is accepted)")
+    else:
+        print("    verify: DETECTED")
+    print(f"    replay: {outcome(not forged_verdict.is_passing())} [{forged_verdict.status.value}] {forged_verdict.details}")
+    print("\n[Attack 3] Strip the 'simulated' labels, set summary.md NDCG@10 to 0.9912, rewrite its checksum")
+    print(f"    verify: {'PASSES' if relabel_passes_verify else 'DETECTED'}")
+    print(f"    replay: {outcome(not relabel_verdict.is_passing())} [{relabel_verdict.status.value}] {relabel_verdict.details}")
     print("\n[i] Not covered: someone who changes the spec itself and repackages gets a capsule that")
     print("    passes both checks, and for a real model run, replay means re-running the model.")
     print("    Proving who produced a capsule needs a signature, which this prototype does not have.")
     print("=" * 70)
 
-    return 0 if (naive_caught and forged_caught) else 1
+    caught_all = naive_caught and not forged_verdict.is_passing() and not relabel_verdict.is_passing()
+    return 0 if caught_all else 1
 
 
 def main() -> int:
@@ -257,7 +306,7 @@ def main() -> int:
 
     # run
     p_run = subparsers.add_parser("run", help="Run the simulated benchmark and create an evidence capsule")
-    p_run.add_argument("--queries", type=int, default=5, help="Number of queries to evaluate")
+    p_run.add_argument("--queries", type=_positive_int, default=5, help="Number of queries to evaluate (at least 1)")
     p_run.add_argument("--seed", type=int, default=42, help="Deterministic random seed")
     p_run.add_argument("--ceiling", type=int, default=100, help="Maximum query ceiling")
     p_run.add_argument("--mode", type=str, default="LOCAL_BOUNDED", choices=["LOCAL_BOUNDED", "REMOTE_DISPATCH"])

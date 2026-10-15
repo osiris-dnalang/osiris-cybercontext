@@ -100,19 +100,20 @@ def run_demo() -> int:
         if res_adv.is_safe:
             print(f"     Status:                     [NOT CAUGHT]")
         else:
-            print(f"     Status:                     [BLOCKED] by the {res_adv.detection_layer} layer")
+            print(f"     Status:                     [FLAGGED] by the {res_adv.detection_layer} layer")
             print(f"     Reason:                     {res_adv.quarantine_reason}")
         checks.append(("adversarial turn is flagged", not res_adv.is_safe))
 
         # Log the screening result to the ledger
         rec_fw = ledger.append(
             domain="CYBERCONTEXT_IME",
-            action="INJECTION_INTERCEPTED" if not res_adv.is_safe else "TURN_PASSED",
+            action="TURN_FLAGGED" if not res_adv.is_safe else "TURN_PASSED",
             payload_data={"turn": adversarial_turn},
             metric_data={"quarantine_reason": res_adv.quarantine_reason},
         )
         print(f"     Ledger:                     block #{rec_fw.entry_id} appended")
-        print("     Note: heuristic screen; obfuscated payloads can get past both layers.")
+        print("     Note: heuristic screen that returns a verdict; nothing is blocked by it, and")
+        print("           obfuscated payloads can get past both layers.")
 
         # =========================================================================
         # PART 3: Substrate profile and mock device event
@@ -121,7 +122,7 @@ def run_demo() -> int:
         bridge = TandemoniumSubstrateBridge(ledger=ledger)
         print(f"  |-- Host (detected):            {bridge.profile.system} / {bridge.profile.machine}")
         print(f"  |-- Substrate class:            {bridge.profile.substrate.value}")
-        print(f"  |-- CPU SIMD flags (detected):  {bridge.profile.hardware_acceleration}")
+        print(f"  |-- SIMD flags checked:         {bridge.profile.hardware_acceleration}")
         print(f"  |-- Execution horizon:          {bridge.profile.max_execution_horizon_sec:.1f}s (configured default, not enforced)")
 
         mock_event = DeviceEvent(
@@ -158,8 +159,8 @@ def run_demo() -> int:
         tamper_intact, tamper_msg = ledger.verify_integrity()
         print(f"  Post-edit check:               {'[PASS] (edit NOT detected)' if tamper_intact else '[ALERT: TAMPERING DETECTED]'}")
         print(f"  Diagnostic:                    {tamper_msg}")
-        print("  Note: someone with write access could also recompute every later hash;")
-        print("        this check catches in-place edits, not a full rewrite of the chain.")
+        print("  Note: this catches edits that leave the stored hashes alone. Deleting the newest")
+        print("        blocks, or rewriting a block and recomputing every later hash, is not caught.")
         checks.append(("in-place edit is detected", not tamper_intact))
 
         passed = sum(1 for _, ok in checks if ok)
@@ -171,7 +172,7 @@ def run_demo() -> int:
             for name, ok in checks:
                 if not ok:
                     print(f"    - unexpected: {name}")
-        print("  Pete: Cognition proposes; the local substrate enforces and records.")
+        print("  Pete: Cognition proposes; the local runtime checks and records.")
         print("=" * 80)
         return 0 if passed == len(checks) else 1
 

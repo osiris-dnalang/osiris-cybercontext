@@ -5,9 +5,12 @@ for REMOTE_DISPATCH) and records each query in a hash-chained ledger.
 
 The retrieval itself is simulated. No model or dataset is loaded. Query texts
 come from a fixed list of ten SciFact-style placeholder claims (cycled when more
-than ten queries are requested); they are not read from the BEIR SciFact
-dataset. Retrieved document IDs come from a seeded random generator, and one
-"relevant" document is planted at a random rank. The resulting NDCG@10 and
+than ten queries are requested, so query IDs repeat); they are not read from the
+BEIR SciFact dataset. A simulated ranking can contain the same document ID
+twice. Retrieved document IDs come from a seeded random generator, and one
+"relevant" document is planted at a random rank, or left out of the top k
+(2 chances in top_k + 2, so about 1 query in 6 at top_k=10). NDCG@10 and MRR@10
+are computed over the first 10 retrieved documents. The resulting NDCG@10 and
 MRR@10 values exercise the evidence pipeline. They say nothing about any
 model's retrieval quality.
 """
@@ -34,13 +37,13 @@ from .schema import (
 RETRIEVAL_BACKEND = "simulated-seeded-rng"
 SIMULATION_NOTICE = (
     "Simulated retrieval: no model or dataset is loaded. Document IDs come from a "
-    "seeded RNG and the relevant document is planted, so the metrics test the "
-    "evidence pipeline, not a model."
+    "seeded RNG and a relevant document is planted at a random rank (or left out), "
+    "so the metrics test the evidence pipeline, not a model."
 )
 
 
 class GovernanceAuthorizationViolation(Exception):
-    """Raised when an operation is attempted without valid cryptographic authority (SYS-021)."""
+    """Raised when an operation lacks a valid authorization grant (SYS-021); see AuthorizationGrant for its limits."""
     pass
 
 
@@ -54,7 +57,7 @@ class QueryRecord:
     query_id: str
     query_text: str
     retrieved_doc_ids: List[str]
-    relevance_scores: List[float]
+    relevance_scores: List[float]  # 0/1 relevance label per retrieved doc, not retriever scores
     ndcg_at_10: float
     mrr_at_10: float
     query_digest: str
@@ -71,6 +74,11 @@ class ExecutionResult:
     environment_telemetry: Dict[str, Any]
     elapsed_seconds: float
     retrieval_backend: str = RETRIEVAL_BACKEND
+
+    @property
+    def merkle_root(self) -> str:
+        """Deprecated alias for chain_digest (the value is not a Merkle root)."""
+        return self.chain_digest
 
 
 class EvidenceWorkbenchEngine:
@@ -95,11 +103,11 @@ class EvidenceWorkbenchEngine:
         if policy.mode == "REMOTE_DISPATCH" or policy.require_authorization_grant:
             if policy.grant is None:
                 raise GovernanceAuthorizationViolation(
-                    f"Remote dispatch rejected: Missing cryptographic authorization grant for payload {spec_digest[:16]}."
+                    f"Remote dispatch rejected: missing authorization grant for payload {spec_digest[:16]}."
                 )
             if not policy.grant.verify(spec_digest):
                 raise GovernanceAuthorizationViolation(
-                    f"Remote dispatch rejected: Grant signature mismatch for payload {spec_digest[:16]}."
+                    f"Remote dispatch rejected: grant does not match payload {spec_digest[:16]}."
                 )
 
         # Environment Telemetry Capture
@@ -141,11 +149,11 @@ class EvidenceWorkbenchEngine:
             if rel_rank <= spec.top_k:
                 retrieved_docs[rel_rank - 1] = relevant_doc
 
-            # Compute NDCG@10 and MRR@10. The relevant document counts once, at its
-            # first rank: a random filler ID can collide with it, and counting
-            # both copies pushed NDCG above 1.
+            # Compute NDCG@10 and MRR@10 over the first 10 documents. The relevant
+            # document counts once, at its first rank: a random filler ID can
+            # collide with it, and counting both copies pushed NDCG above 1.
             hit_rank = next(
-                (idx for idx, d in enumerate(retrieved_docs[:spec.top_k], start=1) if d == relevant_doc),
+                (idx for idx, d in enumerate(retrieved_docs[:min(spec.top_k, 10)], start=1) if d == relevant_doc),
                 None,
             )
             dcg = 1.0 / math.log2(hit_rank + 1) if hit_rank else 0.0

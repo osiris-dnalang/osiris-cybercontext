@@ -1,6 +1,6 @@
 """DNA-Lang Evidence Workbench.
 
-Turn computational and dense retrieval experiments into reproducible, inspectable evidence packages.
+Package computational and dense-retrieval experiments into inspectable, replayable evidence capsules.
 """
 
 from .schema import ExperimentSpec, ExecutionPolicy, AuthorizationGrant
