@@ -10,7 +10,11 @@ from typing import Any, Dict, List, Optional
 
 
 def canonical_json_bytes(data: Any) -> bytes:
-    """RFC 8785 deterministic JSON representation."""
+    """Deterministic JSON bytes: sorted keys, compact separators, UTF-8, NaN rejected.
+
+    Modeled on RFC 8785 (JCS) but not a full implementation: floats use
+    Python's repr, and keys sort by code point rather than by UTF-16 units.
+    """
     return json.dumps(
         data,
         ensure_ascii=False,
@@ -30,7 +34,14 @@ def compute_sha256(data: bytes | str) -> str:
 
 @dataclass
 class AuthorizationGrant:
-    """Cryptographic authorization grant (SYS-021 invariant)."""
+    """Authorization grant bound to a spec digest (SYS-021 invariant).
+
+    Reference placeholder, not a cryptographic signature: ``signature`` is an
+    unkeyed SHA-256 of operator, payload digest and budget, so anyone who knows
+    those values can produce a valid grant. ``expires_at_iso`` and
+    ``max_query_budget`` are recorded but not enforced. Replace with a keyed MAC
+    or a public-key signature (for example Ed25519) before relying on it.
+    """
     grant_id: str
     operator: str
     target_payload_sha256: str
@@ -39,10 +50,10 @@ class AuthorizationGrant:
     signature: str
 
     def verify(self, payload_sha256: str) -> bool:
-        """Verify grant validity against executed payload."""
+        """Check the grant is bound to this payload digest (see class docstring for limits)."""
         if self.target_payload_sha256 != payload_sha256:
             return False
-        # In this reference standard library implementation, signature is operator:payload digest
+        # Unkeyed hash: proves nothing about who issued the grant
         expected_sig = compute_sha256(f"{self.operator}:{self.target_payload_sha256}:{self.max_query_budget}")
         return self.signature == expected_sig
 
@@ -59,7 +70,11 @@ class ExecutionPolicy:
 
 @dataclass
 class ExperimentSpec:
-    """Canonical specification for an Olmo 3 / MTEB dense retrieval benchmark."""
+    """Canonical specification for a dense-retrieval benchmark run.
+
+    ``model_id`` and ``dataset`` are labels recorded in the spec. The reference
+    engine loads neither (see workbench/engine.py).
+    """
     experiment_id: str
     model_id: str
     benchmark_suite: str
@@ -78,7 +93,7 @@ class ExperimentSpec:
         return asdict(self)
 
     def canonical_digest(self) -> str:
-        """Compute RFC 8785 canonical content digest of this experiment specification."""
+        """SHA-256 of the canonical JSON of this spec's identity fields."""
         d = self.to_dict()
         # Exclude variable timestamp from content identity
         identity_subset = {

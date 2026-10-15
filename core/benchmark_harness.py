@@ -1,8 +1,10 @@
-"""Olmo 3 MTEB / BEIR Cryptographic Evaluation Harness.
+"""Ledger-backed scoring helper for MTEB / BEIR-style retrieval benchmarks.
 
-Provides deterministic evaluation logging for dense retrieval benchmarks.
-Binds query embeddings, retrieved document sets, and computed ranking metrics (NDCG@10, MRR@10)
-into an immutable, reproducible ledger.
+This module does not load or run any model, Olmo 3 included. You pass in
+queries with their relevant document IDs and the rankings a retriever produced;
+it computes NDCG@10 and MRR@10 and appends one block per batch to the evidence
+ledger. That block holds the aggregate metrics, the model label and the dataset
+name. It does not record individual document IDs or embeddings.
 """
 
 from __future__ import annotations
@@ -35,7 +37,10 @@ class BatchMetrics:
 
 
 class Olmo3BenchmarkHarness:
-    """Wraps MTEB/BEIR evaluations with cryptographic evidence chains."""
+    """Scores supplied rankings and records the batch result in a hash-chained ledger.
+
+    ``model_name`` is a label stored with the result; nothing is loaded.
+    """
 
     def __init__(self, ledger: EvidenceLedger, model_name: str = "allenai/Olmo-3-7B"):
         self.ledger = ledger
@@ -55,11 +60,19 @@ class Olmo3BenchmarkHarness:
     ) -> Tuple[float, float]:
         """Computes NDCG@k and MRR@k for a single retrieval turn."""
         rel_set = set(query.relevant_doc_ids)
-        binary_rel = [1 if r.doc_id in rel_set else 0 for r in retrieved[:k]]
+        # A relevant document counts once, at its first rank; repeats score 0.
+        seen = set()
+        binary_rel = []
+        for r in retrieved[:k]:
+            hit = r.doc_id in rel_set and r.doc_id not in seen
+            binary_rel.append(1 if hit else 0)
+            if hit:
+                seen.add(r.doc_id)
 
-        # DCG & IDCG
+        # DCG & IDCG. The ideal ranking puts every relevant document first,
+        # including the ones the retriever missed.
         dcg = cls.compute_dcg(binary_rel, k)
-        ideal_rel = sorted(binary_rel, reverse=True)
+        ideal_rel = [1] * min(len(rel_set), k)
         idcg = cls.compute_dcg(ideal_rel, k)
         ndcg = (dcg / idcg) if idcg > 0 else 0.0
 
@@ -78,7 +91,7 @@ class Olmo3BenchmarkHarness:
         queries: List[RetrievalQuery],
         ranking_results: Dict[str, List[RetrievedResult]],
     ) -> BatchMetrics:
-        """Evaluates a batch of BEIR queries and commits a signed block to the ledger."""
+        """Scores a batch of queries and appends one (unsigned) block to the ledger."""
         ndcg_list = []
         mrr_list = []
 
@@ -91,7 +104,7 @@ class Olmo3BenchmarkHarness:
         mean_ndcg = sum(ndcg_list) / len(ndcg_list) if ndcg_list else 0.0
         mean_mrr = sum(mrr_list) / len(mrr_list) if mrr_list else 0.0
 
-        # Estimate Corpus Task Complexity (quadratic cross-corpus dispersion metric)
+        # Corpus Task Complexity: a derived convenience score, not a standard IR metric.
         ctc_score = round(1.0 - (mean_ndcg * 0.8 + mean_mrr * 0.2), 4)
 
         metrics = {
@@ -103,7 +116,7 @@ class Olmo3BenchmarkHarness:
             "corpus_task_complexity": ctc_score,
         }
 
-        # Commit immutable block to the evidence ledger
+        # Append the batch result to the hash-chained ledger
         self.ledger.append(
             domain="MTEB_BEIR_EVAL",
             action=f"EVAL_{dataset_name.upper()}",

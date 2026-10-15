@@ -1,13 +1,19 @@
-"""Evidence Replay Engine.
+"""Evidence replay engine.
 
-Re-executes computational experiments against verified canonical specifications,
-comparing replay distributions and metrics against registered evidence capsules.
+Replay re-runs the experiment described by a capsule's spec with the code that
+is installed now, then compares the result with what the capsule stored: the
+aggregate metrics, every per-query record, and the ledger chain digest.
+
+For the simulated reference engine this is a determinism check (same seed and
+same code give the same output). It is not an independent reproduction of a
+model evaluation. The capsule does not pin a code version, so a change to the
+engine code also shows up as drift.
 """
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict
 
 from .capsule import EvidenceCapsule
@@ -17,6 +23,8 @@ from .schema import ExperimentSpec, ExecutionPolicy
 
 class ReplayStatus(enum.Enum):
     EXACT_MATCH = "EXACT_MATCH"
+    # Aggregate metrics within tolerance. Meant for non-deterministic backends;
+    # the simulated engine produces exact matches or drift.
     STATISTICAL_EQUIVALENCE = "STATISTICAL_EQUIVALENCE"
     DRIFT_DETECTED = "DRIFT_DETECTED"
     TAMPER_DETECTED = "TAMPER_DETECTED"
@@ -29,19 +37,20 @@ class ReplayVerdict:
     stored_metrics: Dict[str, float]
     replay_metrics: Dict[str, float]
     metric_diffs: Dict[str, float]
-    merkle_verified: bool
+    chain_digest_verified: bool
     details: str
+    records_verified: bool = False
 
     def is_passing(self) -> bool:
         return self.status in (ReplayStatus.EXACT_MATCH, ReplayStatus.STATISTICAL_EQUIVALENCE)
 
 
 class ReplayEngine:
-    """Verifies and replays evidence capsules in an isolated environment."""
+    """Checks a capsule's file checksums, re-runs its spec and compares the results."""
 
     @classmethod
     def replay(cls, capsule_path: str, tolerance: float = 1e-4) -> ReplayVerdict:
-        """Unpacks capsule, verifies cryptographic integrity, replays run, and diffs metrics."""
+        """Checks file checksums, re-runs the stored spec in a fresh engine, and diffs the results."""
         # 1. Unpack and verify capsule integrity
         try:
             capsule_data = EvidenceCapsule.unpack(capsule_path)
@@ -52,14 +61,15 @@ class ReplayEngine:
                 stored_metrics={},
                 replay_metrics={},
                 metric_diffs={},
-                merkle_verified=False,
+                chain_digest_verified=False,
                 details=f"Capsule verification failed: {e}",
             )
 
         manifest = capsule_data["manifest"]
         spec_dict = manifest["spec"]
         stored_metrics = manifest["metrics"]
-        stored_merkle = manifest["merkle_root"]
+        stored_digest = manifest["chain_digest"]
+        stored_records = capsule_data["raw_queries"]
         stored_spec_digest = manifest["spec_digest"]
 
         # Reconstruct ExperimentSpec from manifest
@@ -94,7 +104,7 @@ class ReplayEngine:
                 stored_metrics=stored_metrics,
                 replay_metrics={},
                 metric_diffs={},
-                merkle_verified=False,
+                chain_digest_verified=False,
                 details=f"Canonical spec digest mismatch: stored {stored_spec_digest[:16]} != computed {replay_spec_digest[:16]}",
             )
 
@@ -103,8 +113,12 @@ class ReplayEngine:
         replay_result = engine.execute(spec)
         replay_metrics = replay_result.metrics
 
-        # Compare Merkle roots
-        merkle_match = (replay_result.merkle_root == stored_merkle)
+        # Compare the ledger chain digest and every per-query record
+        digest_match = (replay_result.chain_digest == stored_digest)
+        replay_records = [asdict(q) for q in replay_result.evaluated_queries]
+        mismatched_records = sum(1 for a, b in zip(stored_records, replay_records) if a != b)
+        mismatched_records += abs(len(stored_records) - len(replay_records))
+        records_match = mismatched_records == 0
 
         # 3. Compute metric diffs
         metric_diffs = {}
@@ -118,15 +132,27 @@ class ReplayEngine:
                 max_diff = diff
 
         # 4. Classify status
-        if max_diff == 0.0 and merkle_match:
-            status = ReplayStatus.EXACT_MATCH
-            details = f"Bit-for-bit exact replay match. Merkle root verified: {stored_merkle[:16]}..."
-        elif max_diff <= tolerance:
-            status = ReplayStatus.STATISTICAL_EQUIVALENCE
-            details = f"Replay matched within statistical tolerance (max_diff={max_diff} <= {tolerance})."
-        else:
+        if not records_match:
+            status = ReplayStatus.DRIFT_DETECTED
+            details = (
+                f"{mismatched_records} of {max(len(stored_records), len(replay_records))} "
+                "per-query records differ from the replay."
+            )
+        elif max_diff > tolerance:
             status = ReplayStatus.DRIFT_DETECTED
             details = f"Metric drift detected: max_diff={max_diff} exceeds tolerance {tolerance}."
+        elif max_diff > 0.0:
+            status = ReplayStatus.STATISTICAL_EQUIVALENCE
+            details = f"Replay matched within tolerance (max_diff={max_diff} <= {tolerance})."
+        elif not digest_match:
+            status = ReplayStatus.DRIFT_DETECTED
+            details = "Metrics and per-query records match, but the ledger chain digest differs from the stored value."
+        else:
+            status = ReplayStatus.EXACT_MATCH
+            details = (
+                "Exact match: metrics, per-query records and chain digest "
+                f"{stored_digest[:16]}... (re-run with the installed code)."
+            )
 
         return ReplayVerdict(
             status=status,
@@ -134,6 +160,7 @@ class ReplayEngine:
             stored_metrics=stored_metrics,
             replay_metrics=replay_metrics,
             metric_diffs=metric_diffs,
-            merkle_verified=merkle_match,
+            chain_digest_verified=digest_match,
             details=details,
+            records_verified=records_match,
         )

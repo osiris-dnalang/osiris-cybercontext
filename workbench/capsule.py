@@ -1,7 +1,8 @@
-"""Evidence Capsule Packager and Parser.
+"""Evidence capsule packager and parser.
 
-Bundles canonical experiment specifications, execution ledgers, raw evaluation records,
-and cryptographic checksums into self-verifying research capsules.
+Bundles the experiment spec, the per-query records and a summary into a
+.evidence.zip capsule, with a manifest listing each file's SHA-256. The manifest
+itself is not signed (see EvidenceCapsule.unpack).
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from dataclasses import asdict
 from typing import Any, Dict
 
 from core.ledger import compute_sha256
-from .engine import ExecutionResult
+from .engine import ExecutionResult, RETRIEVAL_BACKEND, SIMULATION_NOTICE
 from .schema import canonical_json_bytes, ExperimentSpec
 
 
@@ -30,16 +31,20 @@ class EvidenceCapsule:
         raw_queries_sha = compute_sha256(raw_queries_bytes)
 
         # 2. Prepare summary.md
+        simulated = result.retrieval_backend == RETRIEVAL_BACKEND
+        notice = SIMULATION_NOTICE if simulated else ""
         summary_md = (
             f"# DNA-Lang Evidence Capsule: {result.spec.experiment_id}\n\n"
-            f"- **Model:** {result.spec.model_id}\n"
-            f"- **Dataset:** {result.spec.dataset} ({result.spec.split})\n"
+            + (f"> {notice}\n\n" if notice else "")
+            + f"- **Retrieval Backend:** {result.retrieval_backend}\n"
+            f"- **Model{' Label (not loaded)' if simulated else ''}:** {result.spec.model_id}\n"
+            f"- **Dataset{' Label (placeholder queries)' if simulated else ''}:** {result.spec.dataset} ({result.spec.split})\n"
             f"- **Canonical Spec Digest:** `{result.spec_digest}`\n"
-            f"- **Merkle Root:** `{result.merkle_root}`\n"
+            f"- **Ledger Chain Digest:** `{result.chain_digest}`\n"
             f"- **Queries Evaluated:** {result.metrics['queries_evaluated']}\n"
             f"- **NDCG@10:** {result.metrics['NDCG@10']}\n"
             f"- **MRR@10:** {result.metrics['MRR@10']}\n"
-            f"- **Corpus Task Complexity:** {result.metrics['CTC']}\n"
+            f"- **CTC (derived score):** {result.metrics['CTC']}\n"
             f"- **Execution Time:** {result.elapsed_seconds}s\n"
         )
         summary_md_bytes = summary_md.encode("utf-8")
@@ -47,10 +52,12 @@ class EvidenceCapsule:
 
         # 3. Prepare manifest.json
         manifest = {
-            "version": "1.0.0",
+            "version": "1.1.0",
             "experiment_id": result.spec.experiment_id,
+            "retrieval_backend": result.retrieval_backend,
+            "notice": notice,
             "spec_digest": result.spec_digest,
-            "merkle_root": result.merkle_root,
+            "chain_digest": result.chain_digest,
             "ledger_blocks_count": result.ledger_blocks_count,
             "metrics": result.metrics,
             "environment_telemetry": result.environment_telemetry,
@@ -76,7 +83,14 @@ class EvidenceCapsule:
 
     @staticmethod
     def unpack(capsule_path: str) -> Dict[str, Any]:
-        """Unpacks and cryptographically verifies an evidence capsule."""
+        """Unpack a capsule and check each file against the checksums in its manifest.
+
+        This catches corruption and edits that don't also update the manifest.
+        The manifest itself is unsigned, so someone who edits a file and
+        rewrites its checksum produces a capsule that passes this check.
+        ReplayEngine.replay re-runs the spec and compares the records; proving
+        who produced a capsule would need a signature.
+        """
         if not os.path.exists(capsule_path):
             raise FileNotFoundError(f"Evidence capsule not found: {capsule_path}")
 
@@ -89,6 +103,9 @@ class EvidenceCapsule:
             raise ValueError("Invalid capsule: missing manifest.json")
 
         manifest = json.loads(contents["manifest.json"].decode("utf-8"))
+        # v1.0.0 capsules stored the chain digest under the old name
+        if "chain_digest" not in manifest and "merkle_root" in manifest:
+            manifest["chain_digest"] = manifest["merkle_root"]
 
         # Verify internal file integrity
         manifest_files = manifest.get("manifest_files", {})
