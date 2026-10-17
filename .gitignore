@@ -8,7 +8,12 @@ __pycache__/
 .coverage
 .pytest_cache/
 *.zip
+!*.evidence.zip
 *.tar.gz
+
+# Environment & secrets
+.env
+.osiris_env
 
 # Downloaded datasets
 /data/
